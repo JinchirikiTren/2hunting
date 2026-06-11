@@ -1,0 +1,1 @@
+start cmd /c python threat_hunter.py 

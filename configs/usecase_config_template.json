@@ -1,0 +1,98 @@
+{
+  "uc1": {
+    "dedup_fields": ["file_hash_md5", "file_internalname"],
+    "whitelist_rules": [
+      {
+        "field": "file_internalname",
+        "regex": "^(?:TrialVerifier\\.exe|libxml2\\.dll)$"
+      },
+      {
+        "field": "source_process_path",
+        "regex": ".*\\\\Philips Dynalite\\.*"
+      }
+    ]
+  },
+  "uc2": {
+    "dedup_fields": ["file_hash_md5", "file_internalname", "source_process_path"],
+    "whitelist_rules": [
+      {
+        "field": "file_internalname",
+        "regex": "^libxml2\\.dll$"
+      },
+      {
+        "field": "source_process_path",
+        "regex": ".*\\\\ManageEngine\\.*"
+      }
+    ]
+  },
+  "uc3": {
+    "dedup_fields": ["file_hash_md5", "source_process_path", "target_process_path"],
+    "whitelist_rules": [
+      {
+        "field": "source_process_path",
+        "regex": ".*\\\\Microsoft SQL Server\\.*"
+      }
+    ]
+  },
+  "uc6": {
+    "dedup_fields": ["service_target_name", "target_commandline"],
+    "whitelist_rules": [
+      {
+        "field": "service_target_name",
+        "regex": "^(?:Google Updater|Brother|Kaspersky|Foxit|Microsoft Copilot|TeamViewer|GIGABYTE|Adobe|WPS|Intel|HP Sure Click|Amazon CloudWatch|Bitdefender|UltraViewer|Viettel Endpoint|Remote Packet Capture).*"
+      }
+    ]
+  },
+  "uc19": {
+    "dedup_fields": ["net_target_host_name", "source_process_path"],
+    "whitelist_rules": [
+      {
+        "field": "net_target_host_name",
+        "regex": "^(?:.*\\.com|.*\\.vn|.*\\.net|.*\\.org)$"
+      }
+    ]
+  },
+  "brute_force_ssh": {
+    "dedup_fields": ["source_ip", "username", "destination_ip"],
+    "whitelist_rules": [
+      {
+        "field": "source_ip",
+        "regex": "^10\\.10\\.[0-9]{1,3}\\.[0-9]{1,3}$"
+      },
+      {
+        "field": "source_ip",
+        "regex": "^192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}$"
+      },
+      {
+        "field": "source_ip",
+        "regex": "^172\\.(?:1[6-9]|2[0-9]|3[0-1])\\.[0-9]{1,3}\\.[0-9]{1,3}$"
+      }
+    ]
+  },
+  "phishing_email": {
+    "dedup_fields": ["sender_domain", "subject", "recipient"],
+    "whitelist_rules": [
+      {
+        "field": "sender_domain",
+        "regex": "^.*\\.(?:internal|corp|local)$"
+      },
+      {
+        "field": "sender_domain",
+        "regex": "^(?:microsoft\\.com|google\\.com|amazon\\.com)$"
+      }
+    ]
+  },
+  "malware_execution": {
+    "dedup_fields": ["file_hash_sha256", "target_process_path", "source_process_path"],
+    "whitelist_rules": [
+      {
+        "field": "source_process_path",
+        "regex": "^C:\\\\Windows\\\\System32\\\\.*"
+      },
+      {
+        "field": "target_process_path",
+        "regex": "^C:\\\\Program Files\\\\(x86\\)?\\\\Common Files\\\\.*"
+      }
+    ]
+  }
+}

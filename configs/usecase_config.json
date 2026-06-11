@@ -1,0 +1,55 @@
+{
+  "uc1": {
+    "dedup_fields": ["target_process_path", "hash_sha256"],
+    "whitelist_rules": [
+      {
+        "field": "file_internalname",
+        "regex": "^(?:TrialVerifier\\.exe|libxml2\\.dll)$"
+      },
+      {
+        "field": "source_process_path",
+        "regex": ".*\\\\Philips Dynalite\\.*"
+      }
+    ]
+  },
+  "uc2": {
+    "dedup_fields": ["file_path", "hash_sha256"],
+    "whitelist_rules": [
+      {
+        "field": "file_internalname",
+        "regex": "^libxml2\\.dll$"
+      },
+      {
+        "field": "source_process_path",
+        "regex": ".*\\\\ManageEngine\\.*"
+      }
+    ]
+  },
+  "uc3": {
+    "dedup_fields": ["source_process_path", "target_commandline"],
+    "whitelist_rules": [
+      {
+        "field": "source_process_path",
+        "regex": ".*\\\\Microsoft SQL Server\\.*"
+      }
+    ]
+  },
+  "uc6": {
+    "dedup_fields": ["service_target_file_path"],
+    "whitelist_rules": [
+      {
+        "field": "service_target_name",
+        "regex": "^(?:Google Updater|Brother|Kaspersky|Foxit|Microsoft Copilot|TeamViewer|GIGABYTE|Adobe|WPS|Intel|HP Sure Click|Amazon CloudWatch|Bitdefender|UltraViewer|Viettel Endpoint|Remote Packet Capture).*"
+      }
+    ]
+  },
+  "uc19": {
+    "dedup_fields": ["net_target_host_name", "source_process_path"],
+    "whitelist_rules": [
+      {
+        "field": "net_target_host_name",
+        "regex": "^(?:.*\\.com|.*\\.vn|.*\\.net|.*\\.org)$"
+      }
+    ]
+  }
+}

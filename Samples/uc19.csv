@@ -1,0 +1,5 @@
+net_target_host_name,source_process_path,source_process_sha256,client_id,Customer,Product,platform_family,TimeStamp,net_target_host_name_parrent,created_date
+001fxh9-i18n.8xdfd3t6f.com,C:\Program Files\Mozilla Firefox\firefox.exe,3872a5084cf5b91361291e01b6af280ae8abd8a70c83f78d72b8547ef3582aae,['4F8A3C55F8D907258840903C399C22795F5F4DFD'],['vinatao'],['EDR'],['Standalone Workstation'],178011547,8xdfd3t6f.com,8/23/2024
+001fxh9-tiger-fluid.bjravv03.com,C:\Program Files\Mozilla Firefox\firefox.exe,3872a5084cf5b91361291e01b6af280ae8abd8a70c83f78d72b8547ef3582aae,['4F8A3C55F8D907258840903C399C22795F5F4DFD'],['vinatao'],['EDR'],['Standalone Workstation'],178011547,bjravv03.com,3/13/2025
+001ir33gec-api.8xdfd3t6f.com,C:\Program Files\Mozilla Firefox\firefox.exe,3872a5084cf5b91361291e01b6af280ae8abd8a70c83f78d72b8547ef3582aae,['4F8A3C55F8D907258840903C399C22795F5F4DFD'],['vinatao'],['EDR'],['Standalone Workstation'],178011547,8xdfd3t6f.com,8/23/2024
+0901183260masothue.com,C:\Program Files\Google\Chrome\Application\chrome.exe,,['2274A37176D72C234B62FE7A3B06E2EEE6734FDE'],['vinatao'],['EDR'],[],178011547,0901183260masothue.com,No info
