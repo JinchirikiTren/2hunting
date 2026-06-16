@@ -5,10 +5,10 @@ Threat Hunter — Automated Log Processing Pipeline
 High-performance ETL pipeline for SOC threat hunting shift logs.
 
 Processes CSV-exported logs through:
-  1. Regex-based whitelist filtering (noise reduction)
+  1. CSV-based whitelist filtering (noise reduction via whitelists/<usecase>.csv)
   2. Historical data aggregation (past 5 days, same usecase)
   3. Frequency counting on deduplication fields
-  4. Structured output with archival
+  4. Structured output with archival + is_benign flag
 
 Each run auto-creates a timestamp-based subdirectory under the date folder,
 so multiple runs per day never overwrite each other.
@@ -53,6 +53,7 @@ DEFAULT_INPUT_DIR: str = "input_logs"
 DEFAULT_OUTPUT_DIR: str = "processed_logs"
 DEFAULT_ARCHIVE_DIR: str = "archive_logs"
 DEFAULT_CONFIG_PATH: str = os.path.join("configs", "usecase_config.json")
+DEFAULT_WHITELIST_DIR: str = "whitelists"
 HISTORICAL_LOOKBACK_DAYS: int = 5
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,11 @@ Examples:
         help="Root archive directory. Defaults to '%s'." % DEFAULT_ARCHIVE_DIR,
     )
     parser.add_argument(
+        "--whitelist_dir",
+        default=DEFAULT_WHITELIST_DIR,
+        help="Directory containing whitelist CSV files. Defaults to '%s/'." % DEFAULT_WHITELIST_DIR,
+    )
+    parser.add_argument(
         "--run_label",
         default=None,
         help="Optional human-readable label appended to the run timestamp folder "
@@ -131,8 +137,9 @@ def load_config(config_path: str) -> Dict[str, Any]:
     """Load and validate the usecase configuration JSON.
 
     Returns:
-        Dict keyed by usecase name.  Each value has ``dedup_fields`` (list)
-        and ``whitelist_rules`` (list of {field, regex} dicts).
+        Dict keyed by usecase name.  Each value has ``dedup_fields`` (list).
+        ``whitelist_rules`` is tolerated for backward compatibility but ignored
+        in favour of whitelist CSV files.
 
     Raises:
         FileNotFoundError: if the config file is missing.
@@ -144,79 +151,114 @@ def load_config(config_path: str) -> Dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as fh:
         config: Dict[str, Any] = json.load(fh)
 
-    # Validate structure
     for usecase, cfg in config.items():
         if "dedup_fields" not in cfg:
             raise ValueError("Usecase '%s' is missing required key 'dedup_fields'." % usecase)
         if not isinstance(cfg["dedup_fields"], list) or len(cfg["dedup_fields"]) == 0:
             raise ValueError("'dedup_fields' for '%s' must be a non-empty list." % usecase)
-        if "whitelist_rules" not in cfg:
-            cfg["whitelist_rules"] = []  # tolerate missing whitelist
 
     logger.info("Loaded configuration for %d usecase(s): %s", len(config), ", ".join(config.keys()))
     return config
 
 
 # ---------------------------------------------------------------------------
-# Regex pre-compilation
+# CSV-based Whitelist
 # ---------------------------------------------------------------------------
-def precompile_regexes(
-    whitelist_rules: List[Dict[str, str]],
-) -> List[Tuple[str, re.Pattern]]:
-    """Pre-compile whitelist regex patterns for ultra-fast application.
-
-    Args:
-        whitelist_rules: List of ``{"field": "...", "regex": "..."}`` dicts.
+def _load_whitelist_csv(usecase_name: str, whitelist_dir: str) -> Optional[pd.DataFrame]:
+    """Load the whitelist CSV for *usecase_name* if it exists.
 
     Returns:
-        List of ``(field_name, compiled_pattern)`` tuples.
+        DataFrame with whitelist entries, or None if no whitelist file found.
+        Empty cells are treated as "don't care" (match anything).
     """
-    compiled: List[Tuple[str, re.Pattern]] = []
-    for rule in whitelist_rules:
-        field = rule["field"]
-        pattern = rule["regex"]
-        try:
-            compiled.append((field, re.compile(pattern)))
-        except re.error as exc:
-            logger.error("Invalid regex for field '%s': '%s' — %s. Skipping rule.", field, pattern, exc)
-    logger.debug("Pre-compiled %d whitelist regex pattern(s).", len(compiled))
-    return compiled
+    wl_path = Path(whitelist_dir) / ("%s.csv" % usecase_name)
+    if not wl_path.is_file():
+        logger.debug("No whitelist file for usecase '%s' (%s).", usecase_name, wl_path)
+        return None
+
+    wl_df = read_csv_robust(wl_path)
+    if wl_df.empty:
+        logger.debug("Whitelist file for '%s' is empty.", usecase_name)
+        return None
+
+    logger.info("Loaded whitelist for '%s': %d entries × %d fields (%s).",
+                 usecase_name, len(wl_df), len(wl_df.columns), wl_path)
+    return wl_df
 
 
-# ---------------------------------------------------------------------------
-# Whitelist application (vectorised)
-# ---------------------------------------------------------------------------
 def apply_whitelist(
     df: pd.DataFrame,
-    compiled_rules: List[Tuple[str, re.Pattern]],
+    usecase_name: str,
+    whitelist_dir: str,
 ) -> pd.DataFrame:
-    """Apply whitelist rules to a DataFrame using pure vectorized operations.
+    """Apply whitelist CSV to the log DataFrame.
 
-    Rows matching *any* whitelist rule are **dropped** (removed as noise).
-    This function NEVER iterates over rows — all operations are Pandas-vectorised.
+    Algorithm (vectorised, no row iteration over log rows):
+      1. Read ``whitelists/<usecase>.csv``.
+      2. For each whitelist ROW:
+         a. Get non-empty field→value pairs.
+         b. Build mask: True where ALL non-empty fields match (AND logic).
+         c. OR-accumulate into a global drop-mask.
+      3. Drop log rows where global mask is True.
+
+    Whitelist values are interpreted as **regex patterns**.  Plain text
+    therefore acts as an exact match.  Empty cells are skipped (wildcard).
 
     Args:
-        df: Input DataFrame.
-        compiled_rules: Pre-compiled ``(field, pattern)`` tuples.
+        df:            Input log DataFrame.
+        usecase_name:  Usecase identifier.
+        whitelist_dir: Path to the whitelists directory.
 
     Returns:
-        Filtered DataFrame with whitelisted rows removed.
+        Filtered DataFrame with whitelist-matched rows removed.
     """
-    if df.empty or not compiled_rules:
+    if df.empty:
+        return df
+
+    wl_df = _load_whitelist_csv(usecase_name, whitelist_dir)
+    if wl_df is None:
+        logger.info("No whitelist for '%s' — 0 rows dropped.", usecase_name)
         return df
 
     initial_count = len(df)
-    mask = pd.Series(False, index=df.index)  # rows to DROP
+    wl_fields = list(wl_df.columns)
+    drop_mask = pd.Series(False, index=df.index)
 
-    for field, pattern in compiled_rules:
-        if field not in df.columns:
-            logger.warning("Whitelist field '%s' not found in DataFrame columns. Skipping.", field)
-            continue
-        col = df[field].astype(str)
-        field_mask = col.str.contains(pattern, regex=True, na=False)
-        mask = mask | field_mask  # accumulate: drop if ANY rule matches
+    # Pre-validate fields exist in log
+    missing_fields = [f for f in wl_fields if f not in df.columns]
+    if missing_fields:
+        logger.warning(
+            "Whitelist field(s) %s not found in log columns. These fields will be ignored.",
+            missing_fields,
+        )
 
-    result = df[~mask].copy()
+    # Iterate whitelist rows (typically < 1000 — fine)
+    for _, wl_row in wl_df.iterrows():
+        row_mask = pd.Series(True, index=df.index)  # start: all match
+
+        for field in wl_fields:
+            if field in missing_fields:
+                continue
+            raw_val = wl_row[field]
+            # Skip empty cells (NaN, None, empty string) — treat as wildcard
+            if pd.isna(raw_val) or str(raw_val).strip() == "":
+                continue
+            pattern = str(raw_val)
+            try:
+                field_mask = df[field].astype(str).str.contains(pattern, regex=True, na=False)
+            except re.error as exc:
+                logger.warning(
+                    "Invalid regex in whitelist '%s', field '%s': '%s' — %s. Treating as literal.",
+                    usecase_name, field, pattern, exc,
+                )
+                field_mask = df[field].astype(str).str.contains(
+                    re.escape(pattern), regex=True, na=False,
+                )
+            row_mask = row_mask & field_mask
+
+        drop_mask = drop_mask | row_mask  # OR across whitelist rows
+
+    result = df[~drop_mask].copy()
     dropped = initial_count - len(result)
     if dropped > 0:
         logger.info("Whitelist dropped %d / %d rows (%.1f%%).", dropped, initial_count, 100 * dropped / initial_count)
@@ -229,17 +271,7 @@ def apply_whitelist(
 # Input file resolution
 # ---------------------------------------------------------------------------
 def extract_usecase_from_filename(filename: str) -> str:
-    """Extract the usecase name from a filename.
-
-    Simply uses the file stem (name without extension) as the usecase name.
-    E.g. ``uc1.csv`` → ``uc1``, ``brute_force_ssh.csv`` → ``brute_force_ssh``.
-
-    Args:
-        filename: The file basename (e.g. ``uc1.csv``).
-
-    Returns:
-        Usecase name derived from the filename stem.
-    """
+    """Extract the usecase name from a filename (stem without extension)."""
     return Path(filename).stem
 
 
@@ -255,20 +287,16 @@ def resolve_input_files(
     ip = Path(input_path)
 
     if ip.is_file():
-        # Single file mode
         if ip.suffix.lower() not in (".csv", ".tsv", ".txt"):
             raise ValueError("Input file must be a CSV/TSV: %s" % ip)
         usecase = extract_usecase_from_filename(ip.name)
         if usecase_filter and usecase != usecase_filter:
-            logger.warning(
-                "File '%s' (usecase='%s') does not match --usecase='%s'. Skipping.",
-                ip.name, usecase, usecase_filter,
-            )
+            logger.warning("File '%s' (usecase='%s') does not match --usecase='%s'. Skipping.",
+                           ip.name, usecase, usecase_filter)
             return []
         logger.info("Single-file mode: %s  (usecase: %s)", ip.name, usecase)
         return [(usecase, ip.name, ip)]
 
-    # Directory mode
     if not ip.is_dir():
         raise FileNotFoundError("Input path not found: %s" % input_path)
 
@@ -293,38 +321,18 @@ def resolve_input_files(
 # CSV reading helper
 # ---------------------------------------------------------------------------
 def read_csv_robust(file_path: Path) -> pd.DataFrame:
-    """Read a CSV/TSV file, auto-detecting delimiter and handling quirks.
-
-    Tries comma delimiter first, falls back to tab.  Uses the C engine for
-    maximum throughput.
-
-    Returns:
-        DataFrame (may be empty if file has only a header).
-    """
+    """Read a CSV/TSV file, auto-detecting delimiter."""
     path_str = str(file_path)
-    # Try comma first
     try:
-        df = pd.read_csv(
-            path_str,
-            engine="c",
-            low_memory=False,
-            encoding="utf-8",
-        )
+        df = pd.read_csv(path_str, engine="c", low_memory=False, encoding="utf-8")
         if df.shape[1] >= 2:
             logger.debug("Read %s with comma delimiter — %d columns.", file_path.name, df.shape[1])
             return df
     except Exception:
         pass
 
-    # Try tab-separated
     try:
-        df = pd.read_csv(
-            path_str,
-            sep="\t",
-            engine="c",
-            low_memory=False,
-            encoding="utf-8",
-        )
+        df = pd.read_csv(path_str, sep="\t", engine="c", low_memory=False, encoding="utf-8")
         logger.debug("Read %s with tab delimiter — %d columns.", file_path.name, df.shape[1])
         return df
     except Exception as exc:
@@ -341,22 +349,7 @@ def _find_historical_dates(
     target_days: int = HISTORICAL_LOOKBACK_DAYS,
     max_scan: int = 30,
 ) -> List[str]:
-    """Find up to *target_days* past dates that actually contain data for *usecase_name*.
-
-    Scans backwards day-by-day from *date_str - 1*, skipping days with no
-    matching logs (gaps).  Stops once *target_days* dates with data have been
-    found, or *max_scan* calendar days have been searched.
-
-    Args:
-        date_str:      Reference date (YYYYMMDD).  Today is excluded.
-        processed_dir: Root processed logs directory.
-        usecase_name:  Usecase to match.
-        target_days:   Ideal number of data-days to collect (default 5).
-        max_scan:      Maximum calendar days to scan backwards (default 30).
-
-    Returns:
-        List of YYYYMMDD strings that contain matching logs, newest first.
-    """
+    """Find up to *target_days* past dates that contain data for *usecase_name*."""
     ref_date = datetime.strptime(date_str, "%Y%m%d")
     found: List[str] = []
 
@@ -366,7 +359,6 @@ def _find_historical_dates(
         day_dir = Path(processed_dir) / day_str
         if not day_dir.is_dir():
             continue
-        # Check if ANY timestamp subdirectory has files for this usecase
         has_data = False
         for run_dir in day_dir.iterdir():
             if not run_dir.is_dir():
@@ -390,41 +382,19 @@ def load_historical_data(
     target_days: int = HISTORICAL_LOOKBACK_DAYS,
     max_scan: int = 30,
 ) -> pd.DataFrame:
-    """Load processed logs from past days for the same usecase (excluding today).
-
-    Scans ``processed_logs/<YYYYMMDD>/<HHMMSS>/<usecase>*.csv`` backwards,
-    skipping days with no data (gaps), until *target_days* days of data are
-    collected or *max_scan* calendar days have been searched.  Today's data
-    is NEVER included.
-
-    Args:
-        usecase_name:  The usecase identifier.
-        dedup_fields:  Columns needed for dedup/counting.
-        date_str:      Reference date (YYYYMMDD) — historical = before this date.
-        processed_dir: Root processed logs directory.
-        target_days:   Ideal number of data-days to collect (default 5).
-        max_scan:      Maximum calendar days to scan backwards (default 30).
-
-    Returns:
-        DataFrame with only *dedup_fields* columns, or empty DataFrame.
-    """
+    """Load processed logs from past days for the same usecase (excluding today)."""
     if not dedup_fields:
         return pd.DataFrame()
 
-    # Find dates that actually contain data for this usecase
     dates = _find_historical_dates(date_str, processed_dir, usecase_name, target_days, max_scan)
 
     if not dates:
-        logger.info(
-            "No historical data found for usecase '%s' (scanned %d days back).",
-            usecase_name, max_scan,
-        )
+        logger.info("No historical data found for usecase '%s' (scanned %d days back).",
+                     usecase_name, max_scan)
         return pd.DataFrame(columns=dedup_fields)
 
-    logger.info(
-        "Historical scan: found %d day(s) with data for '%s' (target: %d). Dates: %s",
-        len(dates), usecase_name, target_days, ", ".join(dates),
-    )
+    logger.info("Historical scan: found %d day(s) with data for '%s' (target: %d). Dates: %s",
+                 len(dates), usecase_name, target_days, ", ".join(dates))
 
     frames: List[pd.DataFrame] = []
     for day in dates:
@@ -440,11 +410,6 @@ def load_historical_data(
                     available = [c for c in dedup_fields if c in df.columns]
                     if available:
                         frames.append(df[available].copy())
-                    else:
-                        logger.debug(
-                            "Historical file '%s' has none of the dedup fields. Skipping.",
-                            csv_file.name,
-                        )
                 except Exception as exc:
                     logger.warning("Failed to read historical file '%s': %s", csv_file, exc)
 
@@ -452,10 +417,8 @@ def load_historical_data(
         return pd.DataFrame(columns=dedup_fields)
 
     combined = pd.concat(frames, ignore_index=True, copy=False)
-    logger.info(
-        "Loaded %d historical row(s) for usecase '%s' from %d day(s).",
-        len(combined), usecase_name, len(dates),
-    )
+    logger.info("Loaded %d historical row(s) for usecase '%s' from %d day(s).",
+                 len(combined), usecase_name, len(dates))
     return combined
 
 
@@ -469,61 +432,32 @@ def compute_occurrence_counts(
 ) -> pd.DataFrame:
     """Compute per-row occurrence counts from HISTORICAL data only.
 
-    Today's data is NEVER included in the count.  The count reflects how many
-    times each ``dedup_fields`` combination was seen in the past N days.
-
-    Algorithm:
-      1. ``groupby(dedup_fields).size()`` on **historical only** → ``Occurrence_Count``.
-      2. Left-merge counts onto the **current** DataFrame.
-      3. Rows with no historical match → ``Occurrence_Count = 0`` (new / unseen).
-
-    Args:
-        current_df:    Current (whitelisted) DataFrame.
-        historical_df: Historical DataFrame (dedup columns only, from past days).
-        dedup_fields:  Columns used for deduplication.
-
-    Returns:
-        *current_df* with an added integer ``Occurrence_Count`` column.
+    Today's data is NEVER included.  Count = 0 means "never seen before".
     """
-    # Handle empty current DataFrame (e.g. all rows whitelisted)
     if current_df.empty:
         logger.info("Current DataFrame is empty — assigning empty Occurrence_Count column.")
         current_df["Occurrence_Count"] = pd.Series([], dtype="int64")
         return current_df
 
-    # Validate dedup fields exist in current
     missing = [f for f in dedup_fields if f not in current_df.columns]
     if missing:
-        logger.error(
-            "Dedup field(s) %s not found in current DataFrame columns: %s. "
-            "Occurrence_Count will be set to 0 for all rows.",
-            missing, list(current_df.columns),
-        )
+        logger.error("Dedup field(s) %s not found in current DataFrame columns: %s. "
+                      "Occurrence_Count will be set to 0 for all rows.",
+                      missing, list(current_df.columns))
         current_df["Occurrence_Count"] = 0
         return current_df
 
-    # --- Count occurrences from HISTORICAL data ONLY ---
     if historical_df.empty:
-        # No history at all → every row is unseen before
         logger.info("No historical data — all %d row(s) have Occurrence_Count = 0.", len(current_df))
         current_df["Occurrence_Count"] = 0
         return current_df
 
-    # Align historical columns to dedup_fields
     hist_cols = [c for c in dedup_fields if c in historical_df.columns]
     if not hist_cols:
         logger.warning("Historical data has none of the dedup fields. All Occurrence_Count = 0.")
         current_df["Occurrence_Count"] = 0
         return current_df
 
-    if len(hist_cols) != len(dedup_fields):
-        logger.warning(
-            "Historical data missing some dedup fields. Expected %d, got %d. "
-            "Counts based on available fields only.",
-            len(dedup_fields), len(hist_cols),
-        )
-
-    # GroupBy on historical data only (NOT including current day)
     counts = (
         historical_df[hist_cols]
         .groupby(hist_cols, dropna=False)
@@ -531,19 +465,16 @@ def compute_occurrence_counts(
         .reset_index(name="Occurrence_Count")
     )
 
-    # Left-merge back to current.  NaN → 0 (never seen in history)
     result = current_df.merge(counts, on=hist_cols, how="left")
     result["Occurrence_Count"] = result["Occurrence_Count"].fillna(0).astype(int)
 
     occ = result["Occurrence_Count"]
     unseen = (occ == 0).sum()
-    logger.info(
-        "Occurrence_Count (history only): mean=%.2f, median=%s, max=%s, unseen=%d/%d (%.1f%%).",
-        occ.mean(),
-        str(int(occ.median())) if not occ.empty and not pd.isna(occ.median()) else "N/A",
-        str(int(occ.max())) if not occ.empty and not pd.isna(occ.max()) else "N/A",
-        unseen, len(result), 100 * unseen / len(result) if len(result) > 0 else 0,
-    )
+    logger.info("Occurrence_Count (history only): mean=%.2f, median=%s, max=%s, unseen=%d/%d (%.1f%%).",
+                 occ.mean(),
+                 str(int(occ.median())) if not occ.empty and not pd.isna(occ.median()) else "N/A",
+                 str(int(occ.max())) if not occ.empty and not pd.isna(occ.max()) else "N/A",
+                 unseen, len(result), 100 * unseen / len(result) if len(result) > 0 else 0)
     return result
 
 
@@ -551,14 +482,7 @@ def compute_occurrence_counts(
 # Run timestamp
 # ---------------------------------------------------------------------------
 def generate_run_timestamp(run_label: Optional[str] = None) -> str:
-    """Generate a unique run identifier for the output subdirectory.
-
-    Format: ``HHMMSS`` (e.g. ``145530``).
-    If *run_label* is provided, appends it: ``HHMMSS_label`` (e.g. ``145530_ca1``).
-
-    Guarantees uniqueness by appending a counter if the directory already exists
-    for today's date (handles sub-second re-runs).
-    """
+    """Generate a unique run identifier for the output subdirectory."""
     base = datetime.now().strftime("%H%M%S")
     if run_label:
         base = "%s_%s" % (base, run_label)
@@ -566,21 +490,14 @@ def generate_run_timestamp(run_label: Optional[str] = None) -> str:
 
 
 def make_run_timestamp_unique(
-    ts: str,
-    date_str: str,
-    output_dir: str,
-    archive_dir: str,
+    ts: str, date_str: str, output_dir: str, archive_dir: str,
 ) -> str:
-    """Ensure the run timestamp is unique by appending a counter if needed.
-
-    Checks both output and archive directories for collisions.
-    """
+    """Ensure the run timestamp is unique by appending a counter if needed."""
     candidate = ts
     counter = 2
     while True:
-        out_exists = (Path(output_dir) / date_str / candidate).exists()
-        arc_exists = (Path(archive_dir) / date_str / candidate).exists()
-        if not out_exists and not arc_exists:
+        if not (Path(output_dir) / date_str / candidate).exists() and \
+           not (Path(archive_dir) / date_str / candidate).exists():
             return candidate
         candidate = "%s_%d" % (ts, counter)
         counter += 1
@@ -596,33 +513,20 @@ def save_and_archive(
     archive_path: Optional[Path],
     dry_run: bool = False,
 ) -> None:
-    """Save processed DataFrame to output and optionally archive the source.
-
-    Args:
-        df:           Processed DataFrame.
-        output_path:  Destination path for the processed CSV.
-        source_path:  Original input file path.
-        archive_path: Destination for archiving the original file (or None).
-        dry_run:      If True, skip actual file I/O.
-    """
-    # Ensure output directory exists
+    """Save processed DataFrame to output and optionally archive the source."""
     if not dry_run:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Save processed CSV
     if dry_run:
         logger.info("[DRY-RUN] Would save %d row(s) → %s", len(df), output_path)
     else:
         df.to_csv(output_path, index=False)
         logger.info("Saved %d row(s) → %s", len(df), output_path)
 
-    # Archive original
     if archive_path is not None:
         if not source_path.exists():
-            logger.warning(
-                "Source file '%s' no longer exists — may have been archived by a previous run. Skipping archive.",
-                source_path,
-            )
+            logger.warning("Source file '%s' no longer exists — may have been archived "
+                           "by a previous run. Skipping archive.", source_path)
             return
         if dry_run:
             logger.info("[DRY-RUN] Would archive %s → %s", source_path, archive_path)
@@ -644,26 +548,30 @@ def process_usecase_file(
     run_timestamp: str,
     output_dir: str,
     archive_dir: str,
+    whitelist_dir: str,
     should_archive: bool,
     dry_run: bool = False,
 ) -> bool:
     """Run the full pipeline for a single usecase file.
 
-    Returns:
-        True on success, False on failure.
+    Pipeline steps:
+      1. Read CSV
+      2. Whitelist via whitelists/<usecase>.csv
+      3. Add is_benign column (empty, for analyst markup)
+      4. Load historical data (past 5 days, same usecase)
+      5. Compute Occurrence_Count (history only)
+      6. Save to processed_logs + archive original
     """
     logger.info("=" * 70)
     logger.info("Processing: %s  |  usecase: %s  |  date: %s  |  run: %s",
                  original_filename, usecase_name, date_str, run_timestamp)
 
-    # Lookup config
     if usecase_name not in config:
         logger.warning("SKIP: No configuration entry for usecase '%s'.", usecase_name)
         return False
 
     usecase_cfg = config[usecase_name]
     dedup_fields: List[str] = usecase_cfg["dedup_fields"]
-    whitelist_rules: List[Dict[str, str]] = usecase_cfg.get("whitelist_rules", [])
 
     # ------------------------------------------------------------------
     # Step 1: Read CSV
@@ -676,20 +584,26 @@ def process_usecase_file(
 
     if df.empty:
         logger.warning("Input file '%s' is empty. Exporting empty CSV with headers.", original_filename)
-
-    logger.info("Read %d row(s) × %d column(s) from %s.", len(df), len(df.columns), original_filename)
+    else:
+        logger.info("Read %d row(s) × %d column(s) from %s.", len(df), len(df.columns), original_filename)
 
     # ------------------------------------------------------------------
-    # Step 2: Whitelist (noise reduction)
+    # Step 2: Whitelist via CSV (vectorised)
     # ------------------------------------------------------------------
-    compiled_rules = precompile_regexes(whitelist_rules)
-    df = apply_whitelist(df, compiled_rules)
+    df = apply_whitelist(df, usecase_name, whitelist_dir)
+
+    # ------------------------------------------------------------------
+    # Step 3: Add is_benign column (empty — analyst fills "x" later)
+    # ------------------------------------------------------------------
+    # Use str dtype so empty cells survive CSV round-trip as empty strings
+    # rather than being read back as NaN/float64.
+    df["is_benign"] = ""
 
     if df.empty:
-        logger.info("All rows were whitelisted (removed as noise). Will export empty CSV.")
+        logger.info("All rows were whitelisted. Will export empty CSV.")
 
     # ------------------------------------------------------------------
-    # Step 3: Load historical data
+    # Step 4: Load historical data
     # ------------------------------------------------------------------
     historical_df = load_historical_data(
         usecase_name=usecase_name,
@@ -700,14 +614,13 @@ def process_usecase_file(
     )
 
     # ------------------------------------------------------------------
-    # Step 4: Dedup & Counting
+    # Step 5: Dedup & Counting (history only)
     # ------------------------------------------------------------------
     df = compute_occurrence_counts(df, historical_df, dedup_fields)
 
     # ------------------------------------------------------------------
-    # Step 5: Save & Archive
+    # Step 6: Save & Archive
     # ------------------------------------------------------------------
-    # Output path: processed_logs/<YYYYMMDD>/<HHMMSS>/<original_filename>
     output_path = Path(output_dir) / date_str / run_timestamp / original_filename
     archive_path: Optional[Path] = None
     if should_archive:
@@ -729,7 +642,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         date_str = datetime.now().strftime("%Y%m%d")
         logger.info("No --date provided; using current date: %s", date_str)
     else:
-        # Validate
         try:
             datetime.strptime(args.date, "%Y%m%d")
         except ValueError:
@@ -737,7 +649,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
         date_str = args.date
 
-    # Generate run timestamp for this execution
+    # Generate run timestamp
     run_timestamp = generate_run_timestamp(args.run_label)
     run_timestamp = make_run_timestamp_unique(
         run_timestamp, date_str, args.output_dir, args.archive_dir,
@@ -768,7 +680,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.warning("No input files to process. Exiting.")
         return 0
 
-    # Determine whether to archive (only for default input_dir, not custom paths)
     should_archive = (args.input_path is None)
 
     # Process each file
@@ -785,6 +696,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 run_timestamp=run_timestamp,
                 output_dir=args.output_dir,
                 archive_dir=args.archive_dir,
+                whitelist_dir=args.whitelist_dir,
                 should_archive=should_archive,
                 dry_run=args.dry_run,
             )
@@ -796,14 +708,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             logger.exception("Unhandled exception processing '%s': %s", original_filename, exc)
             failed += 1
 
-    # Summary
     logger.info("=" * 70)
     logger.info("Pipeline complete: %d succeeded, %d failed, %d total.", success, failed, len(files))
     return 0 if failed == 0 else 1
 
 
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     sys.exit(main())
