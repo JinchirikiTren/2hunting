@@ -2,7 +2,7 @@
 
 **High-performance ETL pipeline for Security Operations Center (SOC) threat hunting logs.**
 
-Auto-loads logs from timestamp-named directories (`D:\Log\final\<YYYYMMDD_HHMMSS>\`), filters via CSV-based whitelist, enriches with historical frequency analysis, and archives with an analyst feedback loop. Designed to handle **100,000+ rows in seconds** via pure Pandas vectorization.
+Auto-loads logs from timestamp-named directories (`D:\Log\final\<YYYYMMDD_HHMMSS>\`), filters via CSV-based whitelist, enriches with historical frequency analysis, and archives output with an analyst feedback loop. Designed to handle **100,000+ rows in seconds** via pure Pandas vectorization.
 
 ---
 
@@ -24,47 +24,59 @@ Auto-loads logs from timestamp-named directories (`D:\Log\final\<YYYYMMDD_HHMMSS
 ## 🏗 Architecture
 
 ```
-┌─────────────────────────────┐
-│  D:\Log\final\              │  ← Tool trước tạo ra
-│  ├── 20260627_142209\       │     timestamp dirs
-│  │   ├── output_vrtt\       │
-│  │   │   └── output_final   │
-│  │   │       _uc01_xxx.csv  │
-│  │   ├── uc03\              │
-│  │   ├── uc06\              │
-│  │   └── output_domain\     │
-│  └── 20260627_203015\       │
-│      └── ...                │
-└──────────┬──────────────────┘
-           │
-           │  (auto-detect hoặc manual --timestamp_dir)
-           │
-┌──────────▼──────────────────────────────────────┐
+┌─────────────────────────────────┐
+│  D:\Log\final\                  │  ← Tool trước tạo ra
+│  ├── 20260627_142209\           │     timestamp-named dirs
+│  │   ├── output_vrtt\           │     YYYYMMDD_HHMMSS
+│  │   │   └── output_final       │
+│  │   │       _uc01_xxx.csv      │
+│  │   ├── uc03\                  │
+│  │   ├── uc06\                  │
+│  │   └── output_domain\         │
+│  └── 20260627_203015\           │
+│      └── ...                    │
+└──────────────┬──────────────────┘
+               │
+               │  auto-detect closest hoặc manual --timestamp_dir
+               │  20260627_142209 → parent=20260627, child=142209
+               │
+┌──────────────▼──────────────────────────────────┐
 │              threat_hunter.py                    │
 │                                                  │
-│  1. Resolve input từ timestamp dir + config      │
-│     pattern (vd: uc6 → uc06/final_uc06_merged*) │
+│  1. Resolve input: base_dir/<ts>/<pattern>       │
 │  2. Read CSV (C engine, auto delimiter)         │
-│  3. Whitelist (CSV match)                       │
+│  3. Whitelist via whitelists/<usecase>.csv      │
 │  4. Add is_benign column                        │
 │  5. Load 5-day history (past days only)         │
 │  6. GroupBy → Occurrence_Count (history only)   │
-│  7. Save + Archive                              │
+│  7. Save + Archive (copy output, input untouched)│
 └──────┬──────────┬───────────┘
        │          │
 ┌──────▼──┐  ┌───▼───────────┐
-│processed│  │ archive_logs/ │
-│_logs/   │  │ <YYYYMMDD>/   │
-│<YYYYMMDD>│ │ <HHMMSS>/     │
-│<HHMMSS>/│  └───────────────┘
+│processed│  │ archive_logs/ │   Cả 2 đều là bản sao
+│_logs/   │  │ <parent>/     │   của output. Input
+│<parent>/│  │ <child>/      │   không bị đụng vào.
+│<child>/ │  └───────────────┘
 └──────┬──┘
        │
-       │  (analyst marks is_benign="x")
+       │  analyst mở CSV, điền "x" vào cột is_benign
        │
 ┌──────▼──────┐
-│update_white │   Adds marked rows
-│    .py      │   to whitelists/
+│update_white │   Thêm dòng đã mark vào
+│    .py      │   whitelists/<usecase>.csv
 └─────────────┘
+```
+
+### Cách tên thư mục output được tạo
+
+```
+Input dir:  D:\Log\final\20260627_142209\
+            ───┬─── ──┬──
+               │      └── child  = HHMMSS  (142209)
+               └── parent = YYYYMMDD (20260627)
+
+Output:  processed_logs/20260627/142209/filename.csv
+Archive: archive_logs/20260627/142209/filename.csv
 ```
 
 ---
@@ -102,16 +114,19 @@ ToHunt/
 │   ├── uc3.csv
 │   ├── uc6.csv
 │   └── uc19.csv
-├── processed_logs/             # Output tree (auto-created)
-│   └── <YYYYMMDD>/
+├── processed_logs/             # Output (auto-created)
+│   └── <YYYYMMDD>/             #   parent = YYYYMMDD từ tên dir input
+│       └── <HHMMSS>/           #   child  = HHMMSS từ tên dir input
+│           └── <filename>
+├── archive_logs/               # Bản sao output (auto-created)
+│   └── <YYYYMMDD>/             #   Cấu trúc giống processed_logs
 │       └── <HHMMSS>/
-│           └── <original_filename>
-├── archive_logs/               # Archive (chỉ khi dùng --input_path)
+│           └── <filename>
 └── Samples/                    # Sample data for testing
 
-D:\Log\final\                   # INPUT — tool trước tạo ra
-├── 20260627_142209\            #   timestamp-named directories
-│   ├── output_vrtt\            #   sub-paths per usecase
+D:\Log\final\                   # INPUT — tool trước tạo ra (KHÔNG BAO GIỜ bị sửa)
+├── 20260627_142209\
+│   ├── output_vrtt\
 │   ├── uc03\
 │   ├── uc06\
 │   └── output_domain\
@@ -221,11 +236,20 @@ python threat_hunter.py --base_dir E:\OtherLogs\
 
 # Gắn nhãn run (vd: phân biệt ca)
 python threat_hunter.py --run_label ca1
-# → output: processed_logs/20260627/145530_ca1/
+# Input dir 20260627_142209 → output: processed_logs/20260627/142209_ca1/
 
 # Dry-run + verbose
 python threat_hunter.py --dry-run --verbose
 ```
+
+### Cách output được đặt tên
+
+| Input dir | `--run_label` | Output path |
+|---|---|---|
+| `20260627_142209` | — | `processed_logs/20260627/142209/` |
+| `20260627_142209` | `ca1` | `processed_logs/20260627/142209_ca1/` |
+| `20260627_203015` | — | `processed_logs/20260627/203015/` |
+| *(legacy mode)* | — | `processed_logs/20260627/172711/` (HHMMSS hiện tại) |
 
 ### CLI Reference — `threat_hunter.py`
 
@@ -234,20 +258,21 @@ python threat_hunter.py --dry-run --verbose
 | `--base_dir` | No | `D:\Log\final\` | Thư mục gốc chứa timestamp subdirectories. |
 | `--timestamp_dir` | No | (auto) | Tên thư mục timestamp. Dùng nhiều lần để chọn nhiều dir. |
 | `--usecase` | No | All | Chỉ process usecase này. |
-| `--input_path` | No | — | **Legacy**: đường dẫn trực tiếp đến CSV (bỏ qua timestamp logic). |
+| `--input_path` | No | — | **Legacy**: đường dẫn trực tiếp đến CSV. |
 | `--config` | No | `configs/usecase_config.json` | Path tới config. |
 | `--output_dir` | No | `processed_logs/` | Thư mục output gốc. |
-| `--archive_dir` | No | `archive_logs/` | Thư mục archive gốc (chỉ dùng với `--input_path`). |
+| `--archive_dir` | No | `archive_logs/` | Thư mục archive gốc (bản sao output). |
 | `--whitelist_dir` | No | `whitelists/` | Thư mục chứa whitelist CSV. |
-| `--date` | No | Today | Ngày thực thi `YYYYMMDD`. |
-| `--run_label` | No | (none) | Nhãn cho thư mục run (vd: `ca1` → `145530_ca1`). |
+| `--date` | No | Today | Ngày tham chiếu cho historical lookback `YYYYMMDD`. |
+| `--run_label` | No | (none) | Nhãn gắn vào child dir (vd: `ca1` → `142209_ca1`). |
 | `--verbose` | No | `false` | DEBUG logging. |
 | `--dry-run` | No | `false` | Mô phỏng, không ghi file. |
 
 ### Lưu ý
 
-- **Không archive** khi dùng chế độ timestamp dir — file gốc trong `D:\Log\final\` không bị move.
-- **Archive chỉ hoạt động** với `--input_path` legacy mode.
+- **Input không bị đụng vào**: File trong `D:\Log\final\` không bao giờ bị move hay xoá.
+- **Archive là bản sao output**: `archive_logs/` lưu bản sao của kết quả đã xử lý.
+- **Parent/Child từ tên dir input**: `20260627_142209` → parent=`20260627`, child=`142209`. Không dùng ngày giờ hiện tại.
 
 ---
 
@@ -273,7 +298,7 @@ python threat_hunter.py --dry-run --verbose
 
 ```bash
 # Từ 1 thư mục run cụ thể
-python update_white.py --log_dir processed_logs/20260627/140528/
+python update_white.py --log_dir processed_logs/20260627/142209/
 
 # Từ thư mục ngày (quét tất cả run trong ngày)
 python update_white.py --log_dir processed_logs/20260627/
@@ -300,6 +325,7 @@ python update_white.py --log_dir processed_logs/20260627/ --dry-run --verbose
 ```
 Auto:      quét D:\Log\final\ → chọn <YYYYMMDD_HHMMSS> gần nhất
 Manual:    dùng --timestamp_dir được chỉ định
+Parse:     20260627_142209 → parent=20260627, child=142209
 Pattern:   config[usecase].input_pattern → glob trong timestamp dir
 →          D:\Log\final\<ts>\<pattern>
 ```
@@ -334,10 +360,14 @@ result["Occurrence_Count"] = result["Occurrence_Count"].fillna(0)
 - `0` = chưa từng thấy → đáng ngờ.
 - `> 0` = đã thấy N lần trong lịch sử.
 
-### Step 7 — Save
+### Step 7 — Save & Archive
 ```
-processed_logs/<YYYYMMDD>/<HHMMSS>/<original_filename>
+processed_logs/<parent>/<child>/<filename>
+archive_logs/<parent>/<child>/<filename>     ← bản sao output
 ```
+- `parent` = YYYYMMDD từ tên thư mục input
+- `child` = HHMMSS từ tên thư mục input
+- Input gốc trong `D:\Log\final\` không bị động vào
 
 ---
 
@@ -349,11 +379,13 @@ processed_logs/<YYYYMMDD>/<HHMMSS>/<original_filename>
 | **Pattern không khớp file nào** | WARNING — usecase đó bị bỏ qua. |
 | **Thiếu `input_pattern` trong config** | Lỗi khi load config. |
 | **Thiếu file whitelist** | 0 dòng bị loại, pipeline chạy bình thường. |
+| **Whitelist file rỗng (chỉ có header)** | 0 dòng bị loại. |
 | **dedup_fields không khớp column** | Occurrence_Count = 0. |
 | **Whitelist xoá 100% dòng** | CSV rỗng (chỉ header + is_benign + Occurrence_Count). |
-| **Không có historical data** | Occurrence_Count = 0. |
+| **Không có historical data** | Occurrence_Count = 0 cho tất cả dòng. |
 | **Ngày gap trong history** | Scan tiếp đến khi đủ 5 ngày hoặc hết 30 ngày. |
-| **Regex không hợp lệ** | Tự escape thành literal. |
+| **Regex không hợp lệ trong whitelist** | Tự escape thành literal. |
+| **Tên dir input không đúng format** | Dùng nguyên tên làm child, current date làm parent. |
 
 ---
 
@@ -368,6 +400,17 @@ processed_logs/<YYYYMMDD>/<HHMMSS>/<original_filename>
 ```bash
 python threat_hunter.py --timestamp_dir 20260627_142209 --timestamp_dir 20260627_203015
 ```
+
+### Q: Tên thư mục output được đặt như thế nào?
+Từ tên thư mục input `YYYYMMDD_HHMMSS`:
+- **parent** = `YYYYMMDD` (vd: `20260627`)
+- **child** = `HHMMSS` (vd: `142209`)
+- Output: `processed_logs/20260627/142209/`
+
+Không dùng ngày giờ hiện tại lúc chạy script.
+
+### Q: File trong `D:\Log\final\` có bị move hay xoá không?
+**Không.** Input được đọc và giữ nguyên. Archive là bản sao của output.
 
 ### Q: File whitelist bị xoá hết nội dung thì sao?
 Pipeline vẫn chạy — 0 dòng bị whitelist. Không crash.

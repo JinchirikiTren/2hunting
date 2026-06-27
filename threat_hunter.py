@@ -60,7 +60,20 @@ DEFAULT_ARCHIVE_DIR: str = "archive_logs"
 DEFAULT_CONFIG_PATH: str = os.path.join("configs", "usecase_config.json")
 DEFAULT_WHITELIST_DIR: str = "whitelists"
 HISTORICAL_LOOKBACK_DAYS: int = 5
-TS_DIR_PATTERN = re.compile(r"^\d{8}_\d{6}$")  # YYYYMMDD_HHMMSS
+TS_DIR_PATTERN = re.compile(r"^(\d{8})_(\d{6})$")  # YYYYMMDD_HHMMSS
+
+
+def parse_ts_dir_name(dirname: str) -> Tuple[str, str]:
+    """Parse 'YYYYMMDD_HHMMSS' → (date_YYYYMMDD, time_HHMMSS).
+
+    Returns the original string unchanged if it doesn't match the pattern
+    (for legacy or custom dir names).
+    """
+    m = TS_DIR_PATTERN.match(dirname)
+    if m:
+        return m.group(1), m.group(2)
+    # Not a standard timestamp dir — use as-is for child, current date for parent
+    return datetime.now().strftime("%Y%m%d"), dirname
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +315,7 @@ def _list_timestamp_dirs(base_dir: str) -> List[Tuple[str, Path]]:
 
     result: List[Tuple[str, Path]] = []
     for d in base.iterdir():
-        if d.is_dir() and TS_DIR_PATTERN.match(d.name):
+        if d.is_dir() and TS_DIR_PATTERN.fullmatch(d.name):
             result.append((d.name, d))
     result.sort(key=lambda x: x[0], reverse=True)  # newest first
     return result
@@ -352,22 +365,13 @@ def resolve_input_from_timestamp_dirs(
     config: Dict[str, Any],
     base_dir: str,
     usecase_filter: Optional[str] = None,
-) -> List[Tuple[str, str, Path]]:
+) -> List[Tuple[str, str, Path, str]]:
     """Resolve input files from timestamp-named directories using config patterns.
 
-    For each timestamp directory and each usecase in *config*, applies
-    ``config[usecase]['input_pattern']`` as a glob relative to the timestamp dir.
-
-    Args:
-        timestamp_dirs: List of directory names (e.g. ['20260627_142209']).
-        config:         Usecase configuration.
-        base_dir:       Base directory containing the timestamp dirs.
-        usecase_filter: Optional usecase name to limit processing.
-
     Returns:
-        List of ``(usecase_name, original_filename, full_path)`` tuples.
+        List of ``(usecase_name, original_filename, full_path, ts_dir_name)`` tuples.
     """
-    results: List[Tuple[str, str, Path]] = []
+    results: List[Tuple[str, str, Path, str]] = []
 
     for ts_dir_name in timestamp_dirs:
         ts_path = Path(base_dir) / ts_dir_name
@@ -393,7 +397,7 @@ def resolve_input_from_timestamp_dirs(
                 continue
 
             for fp in matches:
-                results.append((usecase, fp.name, fp))
+                results.append((usecase, fp.name, fp, ts_dir_name))
 
     logger.info("Resolved %d input file(s) across %d timestamp dir(s).",
                  len(results), len(timestamp_dirs))
@@ -609,10 +613,13 @@ def make_run_timestamp_unique(
 def save_and_archive(
     df: pd.DataFrame,
     output_path: Path,
-    source_path: Path,
-    archive_path: Optional[Path],
+    archive_path: Optional[Path] = None,
     dry_run: bool = False,
 ) -> None:
+    """Save processed DataFrame to output, and optionally a copy to archive.
+
+    Input files are NEVER touched — archive is a copy of the output.
+    """
     if not dry_run:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -623,16 +630,12 @@ def save_and_archive(
         logger.info("Saved %d row(s) → %s", len(df), output_path)
 
     if archive_path is not None:
-        if not source_path.exists():
-            logger.warning("Source file '%s' no longer exists — may have been archived "
-                           "by a previous run. Skipping archive.", source_path)
-            return
         if dry_run:
-            logger.info("[DRY-RUN] Would archive %s → %s", source_path, archive_path)
+            logger.info("[DRY-RUN] Would archive copy → %s", archive_path)
         else:
             archive_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source_path), str(archive_path))
-            logger.info("Archived original → %s", archive_path)
+            df.to_csv(archive_path, index=False)
+            logger.info("Archived copy → %s", archive_path)
 
 
 # ---------------------------------------------------------------------------
@@ -642,19 +645,24 @@ def process_usecase_file(
     usecase_name: str,
     original_filename: str,
     file_path: Path,
+    parent_date: str,
+    child_ts: str,
     config: Dict[str, Any],
-    date_str: str,
-    run_timestamp: str,
+    lookback_date: str,
     output_dir: str,
     archive_dir: str,
     whitelist_dir: str,
-    should_archive: bool,
     dry_run: bool = False,
 ) -> bool:
-    """Run the full pipeline for a single usecase file."""
+    """Run the full pipeline for a single usecase file.
+
+    Output: ``output_dir/<parent_date>/<child_ts>/<filename>``
+    Archive: ``archive_dir/<parent_date>/<child_ts>/<filename>`` (copy)
+    Input files in D:\\Log\\final are NEVER touched.
+    """
     logger.info("=" * 70)
-    logger.info("Processing: %s  |  usecase: %s  |  date: %s  |  run: %s",
-                 original_filename, usecase_name, date_str, run_timestamp)
+    logger.info("Processing: %s  |  usecase: %s  |  output: %s/%s",
+                 original_filename, usecase_name, parent_date, child_ts)
 
     if usecase_name not in config:
         logger.warning("SKIP: No configuration entry for usecase '%s'.", usecase_name)
@@ -687,7 +695,7 @@ def process_usecase_file(
     historical_df = load_historical_data(
         usecase_name=usecase_name,
         dedup_fields=dedup_fields,
-        date_str=date_str,
+        date_str=lookback_date,
         processed_dir=output_dir,
         target_days=HISTORICAL_LOOKBACK_DAYS,
     )
@@ -696,12 +704,12 @@ def process_usecase_file(
     df = compute_occurrence_counts(df, historical_df, dedup_fields)
 
     # Step 6: Save & Archive
-    output_path = Path(output_dir) / date_str / run_timestamp / original_filename
-    archive_path: Optional[Path] = None
-    if should_archive:
-        archive_path = Path(archive_dir) / date_str / run_timestamp / original_filename
+    # Output  = processed_logs/<parent_date>/<child_ts>/<filename>
+    # Archive = archive_logs/<parent_date>/<child_ts>/<filename>  (copy)
+    output_path = Path(output_dir) / parent_date / child_ts / original_filename
+    archive_path = Path(archive_dir) / parent_date / child_ts / original_filename
 
-    save_and_archive(df, output_path, file_path, archive_path, dry_run=dry_run)
+    save_and_archive(df, output_path, archive_path, dry_run=dry_run)
     return True
 
 
@@ -724,13 +732,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
         date_str = args.date
 
-    # Generate run timestamp
-    run_timestamp = generate_run_timestamp(args.run_label)
-    run_timestamp = make_run_timestamp_unique(
-        run_timestamp, date_str, args.output_dir, args.archive_dir,
-    )
-    logger.info("Run timestamp: %s", run_timestamp)
-
     # Load config
     try:
         config = load_config(args.config)
@@ -745,33 +746,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # ── Legacy mode: direct CSV path ──
         logger.info("Using legacy --input_path mode.")
         try:
-            files = resolve_input_files_legacy(args.input_path, args.usecase)
+            raw_files = resolve_input_files_legacy(args.input_path, args.usecase)
         except (FileNotFoundError, ValueError) as exc:
             logger.error("Input resolution error: %s", exc)
             return 1
-        should_archive = False
+        # Use current date as parent, HHMMSS as child
+        parent = date_str
+        child = generate_run_timestamp(args.run_label)
+        child = make_run_timestamp_unique(child, parent, args.output_dir, args.archive_dir)
+        logger.info("Run timestamp: %s/%s", parent, child)
+        files: List[Tuple[str, str, Path, str, str]] = [
+            (uc, fn, fp, parent, child) for uc, fn, fp in raw_files
+        ]
     else:
         # ── Timestamp-directory mode ──
         if args.timestamp_dir:
             timestamp_dirs = args.timestamp_dir
             logger.info("Manual timestamp dir(s): %s", ", ".join(timestamp_dirs))
         else:
-            # Auto-select closest timestamp directory
             closest = _find_closest_timestamp_dir(args.base_dir)
             if closest is None:
                 logger.error("No valid timestamp directories found in %s", args.base_dir)
                 return 1
             timestamp_dirs = [closest]
 
-        # Filter usecases to those with matching config
-        usecases_to_process = [args.usecase] if args.usecase else list(config.keys())
-        files = resolve_input_from_timestamp_dirs(
+        files_4 = resolve_input_from_timestamp_dirs(
             timestamp_dirs=timestamp_dirs,
             config=config,
             base_dir=args.base_dir,
             usecase_filter=args.usecase,
         )
-        should_archive = False  # never move files from D:\Log\final
+        # Parse each ts_dir_name → (parent=YYYYMMDD, child=HHMMSS)
+        files = []
+        for uc, fn, fp, ts_name in files_4:
+            parent, child = parse_ts_dir_name(ts_name)
+            if args.run_label:
+                child = "%s_%s" % (child, args.run_label)
+            files.append((uc, fn, fp, parent, child))
 
     if not files:
         logger.warning("No input files to process. Exiting.")
@@ -780,19 +791,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Process each file
     success = 0
     failed = 0
-    for usecase_name, original_filename, file_path in files:
+    for usecase_name, original_filename, file_path, parent_date, child_ts in files:
         try:
             ok = process_usecase_file(
                 usecase_name=usecase_name,
                 original_filename=original_filename,
                 file_path=file_path,
+                parent_date=parent_date,
+                child_ts=child_ts,
                 config=config,
-                date_str=date_str,
-                run_timestamp=run_timestamp,
+                lookback_date=date_str,
                 output_dir=args.output_dir,
                 archive_dir=args.archive_dir,
                 whitelist_dir=args.whitelist_dir,
-                should_archive=should_archive,
                 dry_run=args.dry_run,
             )
             if ok:
