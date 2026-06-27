@@ -2,16 +2,21 @@
 """
 Threat Hunter — Automated Log Processing Pipeline
 ==================================================
-High-performance ETL pipeline for SOC threat hunting shift logs.
+High-performance ETL pipeline for SOC threat hunting logs.
 
-Processes CSV-exported logs through:
-  1. CSV-based whitelist filtering (noise reduction via whitelists/<usecase>.csv)
+Input: auto-loaded from D:\\Log\\final\\<YYYYMMDD_HHMMSS>\\ (configurable).
+Two modes:
+  - Default: auto-select timestamp dir closest to current time.
+  - Manual:  pass one or more --timestamp_dir values.
+
+Each usecase defines an ``input_pattern`` in config that maps to the
+correct sub-path within the timestamp directory.
+
+Processing:
+  1. CSV-based whitelist filtering (whitelists/<usecase>.csv)
   2. Historical data aggregation (past 5 days, same usecase)
   3. Frequency counting on deduplication fields
   4. Structured output with archival + is_benign flag
-
-Each run auto-creates a timestamp-based subdirectory under the date folder,
-so multiple runs per day never overwrite each other.
 
 Designed to handle 100k+ rows in seconds via pure Pandas vectorization.
 """
@@ -49,12 +54,14 @@ def _setup_logging(verbose: bool = False) -> None:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEFAULT_INPUT_DIR: str = "input_logs"
+DEFAULT_BASE_DIR: str = r"D:\Log\final"
 DEFAULT_OUTPUT_DIR: str = "processed_logs"
 DEFAULT_ARCHIVE_DIR: str = "archive_logs"
 DEFAULT_CONFIG_PATH: str = os.path.join("configs", "usecase_config.json")
 DEFAULT_WHITELIST_DIR: str = "whitelists"
 HISTORICAL_LOOKBACK_DAYS: int = 5
+TS_DIR_PATTERN = re.compile(r"^\d{8}_\d{6}$")  # YYYYMMDD_HHMMSS
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -62,16 +69,30 @@ HISTORICAL_LOOKBACK_DAYS: int = 5
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Threat Hunter — automated log processing pipeline for SOC shift logs.",
+        description="Threat Hunter — automated log processing pipeline for SOC logs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Default: auto-select closest timestamp dir from D:\\Log\\final\\
   python threat_hunter.py
+
+  # Process specific usecase(s) only
   python threat_hunter.py --usecase uc6
-  python threat_hunter.py --date 20260610
-  python threat_hunter.py --usecase uc1 --input_path ./Samples/
-  python threat_hunter.py --input_path ./Samples/uc6.csv --dry-run --verbose
-  python threat_hunter.py --run_label ca1
+
+  # Manual: one timestamp directory
+  python threat_hunter.py --timestamp_dir 20260627_142209
+
+  # Manual: multiple timestamp directories
+  python threat_hunter.py --timestamp_dir 20260627_142209 --timestamp_dir 20260627_203015
+
+  # Custom base directory
+  python threat_hunter.py --base_dir E:\\OtherLogs\\
+
+  # Legacy: direct CSV input (bypasses timestamp-dir logic)
+  python threat_hunter.py --input_path ./Samples/uc6.csv
+
+  # Dry-run with label
+  python threat_hunter.py --run_label ca1 --dry-run --verbose
         """,
     )
     parser.add_argument(
@@ -82,12 +103,27 @@ Examples:
     parser.add_argument(
         "--usecase",
         default=None,
-        help="Process only this usecase. If omitted, ALL usecases found in the input path are processed.",
+        help="Process only this usecase. If omitted, ALL usecases defined in config are processed.",
+    )
+    parser.add_argument(
+        "--base_dir",
+        default=DEFAULT_BASE_DIR,
+        help="Base directory containing timestamp-named subdirectories. "
+             "Defaults to '%s'." % DEFAULT_BASE_DIR,
+    )
+    parser.add_argument(
+        "--timestamp_dir",
+        action="append",
+        default=None,
+        help="One or more timestamp directory names (e.g. '20260627_142209'). "
+             "Can be specified multiple times. If omitted, the closest directory "
+             "to the current time is auto-selected.",
     )
     parser.add_argument(
         "--input_path",
         default=None,
-        help="Path to a CSV file or directory of CSVs. Defaults to '%s/'." % DEFAULT_INPUT_DIR,
+        help="Legacy: direct path to a CSV file or directory. When specified, "
+             "timestamp-dir logic is bypassed entirely.",
     )
     parser.add_argument(
         "--config",
@@ -112,7 +148,7 @@ Examples:
     parser.add_argument(
         "--run_label",
         default=None,
-        help="Optional human-readable label appended to the run timestamp folder "
+        help="Optional label appended to the run timestamp folder "
              "(e.g. 'ca1' produces folder '145530_ca1').",
     )
     parser.add_argument(
@@ -136,14 +172,8 @@ Examples:
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load and validate the usecase configuration JSON.
 
-    Returns:
-        Dict keyed by usecase name.  Each value has ``dedup_fields`` (list).
-        ``whitelist_rules`` is tolerated for backward compatibility but ignored
-        in favour of whitelist CSV files.
-
-    Raises:
-        FileNotFoundError: if the config file is missing.
-        ValueError: if the JSON is malformed.
+    Each usecase must define ``dedup_fields`` (list) and ``input_pattern`` (str).
+    ``input_pattern`` is a glob relative to the timestamp directory.
     """
     if not os.path.isfile(config_path):
         raise FileNotFoundError("Configuration file not found: %s" % config_path)
@@ -156,6 +186,8 @@ def load_config(config_path: str) -> Dict[str, Any]:
             raise ValueError("Usecase '%s' is missing required key 'dedup_fields'." % usecase)
         if not isinstance(cfg["dedup_fields"], list) or len(cfg["dedup_fields"]) == 0:
             raise ValueError("'dedup_fields' for '%s' must be a non-empty list." % usecase)
+        if "input_pattern" not in cfg:
+            raise ValueError("Usecase '%s' is missing required key 'input_pattern'." % usecase)
 
     logger.info("Loaded configuration for %d usecase(s): %s", len(config), ", ".join(config.keys()))
     return config
@@ -165,12 +197,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
 # CSV-based Whitelist
 # ---------------------------------------------------------------------------
 def _load_whitelist_csv(usecase_name: str, whitelist_dir: str) -> Optional[pd.DataFrame]:
-    """Load the whitelist CSV for *usecase_name* if it exists.
-
-    Returns:
-        DataFrame with whitelist entries, or None if no whitelist file found.
-        Empty cells are treated as "don't care" (match anything).
-    """
+    """Load the whitelist CSV for *usecase_name* if it exists."""
     wl_path = Path(whitelist_dir) / ("%s.csv" % usecase_name)
     if not wl_path.is_file():
         logger.debug("No whitelist file for usecase '%s' (%s).", usecase_name, wl_path)
@@ -193,24 +220,8 @@ def apply_whitelist(
 ) -> pd.DataFrame:
     """Apply whitelist CSV to the log DataFrame.
 
-    Algorithm (vectorised, no row iteration over log rows):
-      1. Read ``whitelists/<usecase>.csv``.
-      2. For each whitelist ROW:
-         a. Get non-empty field→value pairs.
-         b. Build mask: True where ALL non-empty fields match (AND logic).
-         c. OR-accumulate into a global drop-mask.
-      3. Drop log rows where global mask is True.
-
-    Whitelist values are interpreted as **regex patterns**.  Plain text
-    therefore acts as an exact match.  Empty cells are skipped (wildcard).
-
-    Args:
-        df:            Input log DataFrame.
-        usecase_name:  Usecase identifier.
-        whitelist_dir: Path to the whitelists directory.
-
-    Returns:
-        Filtered DataFrame with whitelist-matched rows removed.
+    Whitelist values are regex patterns.  Empty cells = wildcard (skip).
+    AND within a row, OR across rows.
     """
     if df.empty:
         return df
@@ -224,66 +235,184 @@ def apply_whitelist(
     wl_fields = list(wl_df.columns)
     drop_mask = pd.Series(False, index=df.index)
 
-    # Pre-validate fields exist in log
     missing_fields = [f for f in wl_fields if f not in df.columns]
     if missing_fields:
-        logger.warning(
-            "Whitelist field(s) %s not found in log columns. These fields will be ignored.",
-            missing_fields,
-        )
+        logger.warning("Whitelist field(s) %s not found in log columns. Ignored.", missing_fields)
 
-    # Iterate whitelist rows (typically < 1000 — fine)
     for _, wl_row in wl_df.iterrows():
-        row_mask = pd.Series(True, index=df.index)  # start: all match
-
+        row_mask = pd.Series(True, index=df.index)
         for field in wl_fields:
             if field in missing_fields:
                 continue
             raw_val = wl_row[field]
-            # Skip empty cells (NaN, None, empty string) — treat as wildcard
             if pd.isna(raw_val) or str(raw_val).strip() == "":
                 continue
             pattern = str(raw_val)
             try:
                 field_mask = df[field].astype(str).str.contains(pattern, regex=True, na=False)
             except re.error as exc:
-                logger.warning(
-                    "Invalid regex in whitelist '%s', field '%s': '%s' — %s. Treating as literal.",
-                    usecase_name, field, pattern, exc,
-                )
+                logger.warning("Invalid regex in whitelist '%s', field '%s': '%s' — %s. "
+                               "Treating as literal.", usecase_name, field, pattern, exc)
                 field_mask = df[field].astype(str).str.contains(
-                    re.escape(pattern), regex=True, na=False,
-                )
+                    re.escape(pattern), regex=True, na=False)
             row_mask = row_mask & field_mask
-
-        drop_mask = drop_mask | row_mask  # OR across whitelist rows
+        drop_mask = drop_mask | row_mask
 
     result = df[~drop_mask].copy()
     dropped = initial_count - len(result)
     if dropped > 0:
-        logger.info("Whitelist dropped %d / %d rows (%.1f%%).", dropped, initial_count, 100 * dropped / initial_count)
+        logger.info("Whitelist dropped %d / %d rows (%.1f%%).", dropped, initial_count,
+                     100 * dropped / initial_count)
     else:
         logger.info("Whitelist applied — 0 rows dropped.")
     return result
 
 
 # ---------------------------------------------------------------------------
-# Input file resolution
+# CSV reading helper
+# ---------------------------------------------------------------------------
+def read_csv_robust(file_path: Path) -> pd.DataFrame:
+    """Read a CSV/TSV file, auto-detecting delimiter."""
+    path_str = str(file_path)
+    try:
+        df = pd.read_csv(path_str, engine="c", low_memory=False, encoding="utf-8")
+        if df.shape[1] >= 2:
+            return df
+    except Exception:
+        pass
+    try:
+        df = pd.read_csv(path_str, sep="\t", engine="c", low_memory=False, encoding="utf-8")
+        return df
+    except Exception as exc:
+        raise ValueError("Failed to read CSV/TSV '%s': %s" % (file_path.name, exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Timestamp-directory input resolution
+# ---------------------------------------------------------------------------
+def _list_timestamp_dirs(base_dir: str) -> List[Tuple[str, Path]]:
+    """List valid timestamp directories (YYYYMMDD_HHMMSS) in *base_dir*.
+
+    Returns:
+        List of ``(dirname, full_path)`` sorted newest-first.
+    """
+    base = Path(base_dir)
+    if not base.is_dir():
+        return []
+
+    result: List[Tuple[str, Path]] = []
+    for d in base.iterdir():
+        if d.is_dir() and TS_DIR_PATTERN.match(d.name):
+            result.append((d.name, d))
+    result.sort(key=lambda x: x[0], reverse=True)  # newest first
+    return result
+
+
+def _parse_timestamp(dirname: str) -> datetime:
+    """Parse 'YYYYMMDD_HHMMSS' → datetime."""
+    return datetime.strptime(dirname, "%Y%m%d_%H%M%S")
+
+
+def _find_closest_timestamp_dir(base_dir: str) -> Optional[str]:
+    """Find the timestamp directory closest to (but not after) the current time.
+
+    Returns the directory name (e.g. '20260627_142209'), or None if no valid
+    directories exist.
+    """
+    dirs = _list_timestamp_dirs(base_dir)
+    if not dirs:
+        return None
+
+    now = datetime.now()
+
+    # Prefer the most recent directory that is ≤ now
+    best: Optional[str] = None
+    best_dt: Optional[datetime] = None
+    best_diff: float = float("inf")
+
+    for name, _ in dirs:
+        try:
+            dt = _parse_timestamp(name)
+        except ValueError:
+            continue
+        diff = abs((now - dt).total_seconds())
+        if diff < best_diff:
+            best_diff = diff
+            best = name
+            best_dt = dt
+
+    if best is not None and best_dt is not None:
+        logger.info("Auto-selected timestamp dir: %s  (Δ = %.0f min from now)", best,
+                     best_diff / 60)
+    return best
+
+
+def resolve_input_from_timestamp_dirs(
+    timestamp_dirs: List[str],
+    config: Dict[str, Any],
+    base_dir: str,
+    usecase_filter: Optional[str] = None,
+) -> List[Tuple[str, str, Path]]:
+    """Resolve input files from timestamp-named directories using config patterns.
+
+    For each timestamp directory and each usecase in *config*, applies
+    ``config[usecase]['input_pattern']`` as a glob relative to the timestamp dir.
+
+    Args:
+        timestamp_dirs: List of directory names (e.g. ['20260627_142209']).
+        config:         Usecase configuration.
+        base_dir:       Base directory containing the timestamp dirs.
+        usecase_filter: Optional usecase name to limit processing.
+
+    Returns:
+        List of ``(usecase_name, original_filename, full_path)`` tuples.
+    """
+    results: List[Tuple[str, str, Path]] = []
+
+    for ts_dir_name in timestamp_dirs:
+        ts_path = Path(base_dir) / ts_dir_name
+        if not ts_path.is_dir():
+            logger.warning("Timestamp directory not found: %s — skipping.", ts_path)
+            continue
+
+        usecases = [usecase_filter] if usecase_filter else list(config.keys())
+
+        for usecase in usecases:
+            if usecase not in config:
+                continue
+            pattern = config[usecase].get("input_pattern")
+            if not pattern:
+                logger.debug("No input_pattern for usecase '%s' — skipping.", usecase)
+                continue
+
+            glob_path = ts_path / pattern
+            matches = sorted(ts_path.glob(pattern))
+            if not matches:
+                logger.warning("No files matched for '%s' in %s: %s",
+                               usecase, ts_dir_name, pattern)
+                continue
+
+            for fp in matches:
+                results.append((usecase, fp.name, fp))
+
+    logger.info("Resolved %d input file(s) across %d timestamp dir(s).",
+                 len(results), len(timestamp_dirs))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Legacy input resolution (for --input_path)
 # ---------------------------------------------------------------------------
 def extract_usecase_from_filename(filename: str) -> str:
     """Extract the usecase name from a filename (stem without extension)."""
     return Path(filename).stem
 
 
-def resolve_input_files(
+def resolve_input_files_legacy(
     input_path: str,
     usecase_filter: Optional[str],
 ) -> List[Tuple[str, str, Path]]:
-    """Discover and resolve input CSV files.
-
-    Returns:
-        List of ``(usecase_name, original_filename, full_path)`` tuples.
-    """
+    """Legacy: discover and resolve input CSV files from a file or directory."""
     ip = Path(input_path)
 
     if ip.is_file():
@@ -294,7 +423,7 @@ def resolve_input_files(
             logger.warning("File '%s' (usecase='%s') does not match --usecase='%s'. Skipping.",
                            ip.name, usecase, usecase_filter)
             return []
-        logger.info("Single-file mode: %s  (usecase: %s)", ip.name, usecase)
+        logger.info("Legacy single-file mode: %s  (usecase: %s)", ip.name, usecase)
         return [(usecase, ip.name, ip)]
 
     if not ip.is_dir():
@@ -309,34 +438,11 @@ def resolve_input_files(
     for fp in csv_files:
         usecase = extract_usecase_from_filename(fp.name)
         if usecase_filter and usecase != usecase_filter:
-            logger.debug("Skipping '%s' — does not match usecase filter '%s'.", fp.name, usecase_filter)
             continue
         results.append((usecase, fp.name, fp))
 
-    logger.info("Resolved %d input file(s) for processing.", len(results))
+    logger.info("Legacy mode: resolved %d input file(s).", len(results))
     return results
-
-
-# ---------------------------------------------------------------------------
-# CSV reading helper
-# ---------------------------------------------------------------------------
-def read_csv_robust(file_path: Path) -> pd.DataFrame:
-    """Read a CSV/TSV file, auto-detecting delimiter."""
-    path_str = str(file_path)
-    try:
-        df = pd.read_csv(path_str, engine="c", low_memory=False, encoding="utf-8")
-        if df.shape[1] >= 2:
-            logger.debug("Read %s with comma delimiter — %d columns.", file_path.name, df.shape[1])
-            return df
-    except Exception:
-        pass
-
-    try:
-        df = pd.read_csv(path_str, sep="\t", engine="c", low_memory=False, encoding="utf-8")
-        logger.debug("Read %s with tab delimiter — %d columns.", file_path.name, df.shape[1])
-        return df
-    except Exception as exc:
-        raise ValueError("Failed to read CSV/TSV '%s': %s" % (file_path.name, exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +476,6 @@ def _find_historical_dates(
             found.append(day_str)
             if len(found) >= target_days:
                 break
-
     return found
 
 
@@ -430,10 +535,7 @@ def compute_occurrence_counts(
     historical_df: pd.DataFrame,
     dedup_fields: List[str],
 ) -> pd.DataFrame:
-    """Compute per-row occurrence counts from HISTORICAL data only.
-
-    Today's data is NEVER included.  Count = 0 means "never seen before".
-    """
+    """Compute per-row occurrence counts from HISTORICAL data only (today excluded)."""
     if current_df.empty:
         logger.info("Current DataFrame is empty — assigning empty Occurrence_Count column.")
         current_df["Occurrence_Count"] = pd.Series([], dtype="int64")
@@ -482,7 +584,6 @@ def compute_occurrence_counts(
 # Run timestamp
 # ---------------------------------------------------------------------------
 def generate_run_timestamp(run_label: Optional[str] = None) -> str:
-    """Generate a unique run identifier for the output subdirectory."""
     base = datetime.now().strftime("%H%M%S")
     if run_label:
         base = "%s_%s" % (base, run_label)
@@ -492,7 +593,6 @@ def generate_run_timestamp(run_label: Optional[str] = None) -> str:
 def make_run_timestamp_unique(
     ts: str, date_str: str, output_dir: str, archive_dir: str,
 ) -> str:
-    """Ensure the run timestamp is unique by appending a counter if needed."""
     candidate = ts
     counter = 2
     while True:
@@ -513,7 +613,6 @@ def save_and_archive(
     archive_path: Optional[Path],
     dry_run: bool = False,
 ) -> None:
-    """Save processed DataFrame to output and optionally archive the source."""
     if not dry_run:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -552,16 +651,7 @@ def process_usecase_file(
     should_archive: bool,
     dry_run: bool = False,
 ) -> bool:
-    """Run the full pipeline for a single usecase file.
-
-    Pipeline steps:
-      1. Read CSV
-      2. Whitelist via whitelists/<usecase>.csv
-      3. Add is_benign column (empty, for analyst markup)
-      4. Load historical data (past 5 days, same usecase)
-      5. Compute Occurrence_Count (history only)
-      6. Save to processed_logs + archive original
-    """
+    """Run the full pipeline for a single usecase file."""
     logger.info("=" * 70)
     logger.info("Processing: %s  |  usecase: %s  |  date: %s  |  run: %s",
                  original_filename, usecase_name, date_str, run_timestamp)
@@ -573,9 +663,7 @@ def process_usecase_file(
     usecase_cfg = config[usecase_name]
     dedup_fields: List[str] = usecase_cfg["dedup_fields"]
 
-    # ------------------------------------------------------------------
     # Step 1: Read CSV
-    # ------------------------------------------------------------------
     try:
         df = read_csv_robust(file_path)
     except Exception as exc:
@@ -587,24 +675,15 @@ def process_usecase_file(
     else:
         logger.info("Read %d row(s) × %d column(s) from %s.", len(df), len(df.columns), original_filename)
 
-    # ------------------------------------------------------------------
-    # Step 2: Whitelist via CSV (vectorised)
-    # ------------------------------------------------------------------
+    # Step 2: Whitelist
     df = apply_whitelist(df, usecase_name, whitelist_dir)
 
-    # ------------------------------------------------------------------
-    # Step 3: Add is_benign column (empty — analyst fills "x" later)
-    # ------------------------------------------------------------------
-    # Use str dtype so empty cells survive CSV round-trip as empty strings
-    # rather than being read back as NaN/float64.
+    # Step 3: Add is_benign
     df["is_benign"] = ""
-
     if df.empty:
         logger.info("All rows were whitelisted. Will export empty CSV.")
 
-    # ------------------------------------------------------------------
-    # Step 4: Load historical data
-    # ------------------------------------------------------------------
+    # Step 4: Historical data
     historical_df = load_historical_data(
         usecase_name=usecase_name,
         dedup_fields=dedup_fields,
@@ -613,14 +692,10 @@ def process_usecase_file(
         target_days=HISTORICAL_LOOKBACK_DAYS,
     )
 
-    # ------------------------------------------------------------------
-    # Step 5: Dedup & Counting (history only)
-    # ------------------------------------------------------------------
+    # Step 5: Occurrence counts
     df = compute_occurrence_counts(df, historical_df, dedup_fields)
 
-    # ------------------------------------------------------------------
     # Step 6: Save & Archive
-    # ------------------------------------------------------------------
     output_path = Path(output_dir) / date_str / run_timestamp / original_filename
     archive_path: Optional[Path] = None
     if should_archive:
@@ -656,12 +731,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     logger.info("Run timestamp: %s", run_timestamp)
 
-    # Resolve input path
-    input_path = args.input_path or DEFAULT_INPUT_DIR
-    if not os.path.exists(input_path):
-        logger.error("Input path does not exist: %s", input_path)
-        return 1
-
     # Load config
     try:
         config = load_config(args.config)
@@ -669,18 +738,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.error("Configuration error: %s", exc)
         return 1
 
+    # ------------------------------------------------------------------
     # Resolve input files
-    try:
-        files = resolve_input_files(input_path, args.usecase)
-    except (FileNotFoundError, ValueError) as exc:
-        logger.error("Input resolution error: %s", exc)
-        return 1
+    # ------------------------------------------------------------------
+    if args.input_path:
+        # ── Legacy mode: direct CSV path ──
+        logger.info("Using legacy --input_path mode.")
+        try:
+            files = resolve_input_files_legacy(args.input_path, args.usecase)
+        except (FileNotFoundError, ValueError) as exc:
+            logger.error("Input resolution error: %s", exc)
+            return 1
+        should_archive = False
+    else:
+        # ── Timestamp-directory mode ──
+        if args.timestamp_dir:
+            timestamp_dirs = args.timestamp_dir
+            logger.info("Manual timestamp dir(s): %s", ", ".join(timestamp_dirs))
+        else:
+            # Auto-select closest timestamp directory
+            closest = _find_closest_timestamp_dir(args.base_dir)
+            if closest is None:
+                logger.error("No valid timestamp directories found in %s", args.base_dir)
+                return 1
+            timestamp_dirs = [closest]
+
+        # Filter usecases to those with matching config
+        usecases_to_process = [args.usecase] if args.usecase else list(config.keys())
+        files = resolve_input_from_timestamp_dirs(
+            timestamp_dirs=timestamp_dirs,
+            config=config,
+            base_dir=args.base_dir,
+            usecase_filter=args.usecase,
+        )
+        should_archive = False  # never move files from D:\Log\final
 
     if not files:
         logger.warning("No input files to process. Exiting.")
         return 0
-
-    should_archive = (args.input_path is None)
 
     # Process each file
     success = 0

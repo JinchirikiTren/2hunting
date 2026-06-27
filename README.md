@@ -2,7 +2,7 @@
 
 **High-performance ETL pipeline for Security Operations Center (SOC) threat hunting logs.**
 
-Processes CSV-exported logs through CSV-based whitelist filtering, historical frequency analysis, and structured archival with analyst feedback loop. Designed to handle **100,000+ rows in seconds** via pure Pandas vectorization — zero row iteration.
+Auto-loads logs from timestamp-named directories (`D:\Log\final\<YYYYMMDD_HHMMSS>\`), filters via CSV-based whitelist, enriches with historical frequency analysis, and archives with an analyst feedback loop. Designed to handle **100,000+ rows in seconds** via pure Pandas vectorization.
 
 ---
 
@@ -16,7 +16,6 @@ Processes CSV-exported logs through CSV-based whitelist filtering, historical fr
 - [Usage](#-usage)
 - [Analyst Feedback Loop](#-analyst-feedback-loop)
 - [Pipeline Walkthrough](#-pipeline-walkthrough)
-- [Sample Data](#-sample-data)
 - [Edge Cases & Graceful Degradation](#-edge-cases--graceful-degradation)
 - [FAQ](#-faq)
 
@@ -25,73 +24,62 @@ Processes CSV-exported logs through CSV-based whitelist filtering, historical fr
 ## 🏗 Architecture
 
 ```
-                    ┌──────────────────┐
-                    │  input_logs/     │   Raw CSV files
-                    │  <usecase>.csv   │
-                    └────────┬─────────┘
-                             │
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-  ┌──────▼──────┐   ┌────────▼────────┐   ┌──────▼──────┐
-  │ whitelists/ │   │    configs/     │   │ processed/  │
-  │ uc1.csv     │   │ usecase_config  │   │ <history>   │
-  │ uc6.csv ... │   │ .json           │   │  past 5 days│
-  └──────┬──────┘   └────────┬────────┘   └──────┬──────┘
-         │                   │                   │
-         └───────────────────┼───────────────────┘
-                             │
-              ┌──────────────▼──────────────┐
-              │     threat_hunter.py         │
-              │                              │
-              │  1. Read CSV                 │
-              │  2. Whitelist (CSV match)    │
-              │  3. Add is_benign column     │
-              │  4. Load 5-day history       │
-              │  5. GroupBy → Occurrence_Count│
-              │  6. Save + Archive           │
-              └──────┬──────────┬───────────┘
-                     │          │
-          ┌──────────▼──┐  ┌───▼───────────┐
-          │ processed/  │  │ archive_logs/ │
-          │ <YYYYMMDD>/ │  │ <YYYYMMDD>/   │
-          │ <HHMMSS>/   │  │ <HHMMSS>/     │
-          └──────┬──────┘  └───────────────┘
-                 │
-                 │  (analyst marks is_benign="x")
-                 │
-          ┌──────▼──────┐
-          │update_white │   Adds marked rows
-          │    .py      │   to whitelists/
-          └─────────────┘
+┌─────────────────────────────┐
+│  D:\Log\final\              │  ← Tool trước tạo ra
+│  ├── 20260627_142209\       │     timestamp dirs
+│  │   ├── output_vrtt\       │
+│  │   │   └── output_final   │
+│  │   │       _uc01_xxx.csv  │
+│  │   ├── uc03\              │
+│  │   ├── uc06\              │
+│  │   └── output_domain\     │
+│  └── 20260627_203015\       │
+│      └── ...                │
+└──────────┬──────────────────┘
+           │
+           │  (auto-detect hoặc manual --timestamp_dir)
+           │
+┌──────────▼──────────────────────────────────────┐
+│              threat_hunter.py                    │
+│                                                  │
+│  1. Resolve input từ timestamp dir + config      │
+│     pattern (vd: uc6 → uc06/final_uc06_merged*) │
+│  2. Read CSV (C engine, auto delimiter)         │
+│  3. Whitelist (CSV match)                       │
+│  4. Add is_benign column                        │
+│  5. Load 5-day history (past days only)         │
+│  6. GroupBy → Occurrence_Count (history only)   │
+│  7. Save + Archive                              │
+└──────┬──────────┬───────────┘
+       │          │
+┌──────▼──┐  ┌───▼───────────┐
+│processed│  │ archive_logs/ │
+│_logs/   │  │ <YYYYMMDD>/   │
+│<YYYYMMDD>│ │ <HHMMSS>/     │
+│<HHMMSS>/│  └───────────────┘
+└──────┬──┘
+       │
+       │  (analyst marks is_benign="x")
+       │
+┌──────▼──────┐
+│update_white │   Adds marked rows
+│    .py      │   to whitelists/
+└─────────────┘
 ```
-
-### Data Flow
-
-1. **Ingest**: CSV read with C engine, auto-detected delimiter.
-2. **Whitelist**: Compare against `whitelists/<usecase>.csv`. Rows matching any whitelist entry are dropped.
-3. **Tag**: `is_benign` column added (empty — analyst fills later).
-4. **Enrich**: Historical data from past 5 days loaded. `groupby().size()` computes `Occurrence_Count` (history only, today excluded).
-5. **Export**: Saved to `processed_logs/<YYYYMMDD>/<HHMMSS>/<original_filename>`. Original archived.
-6. **Feedback**: Analyst marks benign rows → `update_white.py` adds them to whitelist.
 
 ---
 
 ## 📋 Prerequisites & Installation
 
-### Requirements
-
 - **Python** 3.8+
 - **pandas** ≥ 1.5.0
-
-### Install
 
 ```bash
 cd ToHunt
 pip install -r requirements.txt
 ```
 
-### Verify
-
+Verify:
 ```bash
 python threat_hunter.py --help
 python update_white.py --help
@@ -105,107 +93,86 @@ python update_white.py --help
 ToHunt/
 ├── threat_hunter.py            # Main pipeline script
 ├── update_white.py             # Whitelist updater (analyst feedback)
-├── requirements.txt            # Python dependencies
-├── README.md                   # This file
-├── Samples/                    # Sample CSV files for testing
-│   ├── uc1.csv
-│   ├── uc2.csv
-│   ├── uc3.csv
-│   ├── uc6.csv
-│   └── uc19.csv
+├── requirements.txt
 ├── configs/
-│   └── usecase_config.json     # Usecase definitions (dedup_fields only)
+│   └── usecase_config.json     # dedup_fields + input_pattern per usecase
 ├── whitelists/                 # Whitelist CSV files (one per usecase)
 │   ├── uc1.csv
 │   ├── uc2.csv
 │   ├── uc3.csv
 │   ├── uc6.csv
 │   └── uc19.csv
-├── input_logs/                 # Drop incoming CSVs here
-│   └── <usecase>.csv           #   File name = usecase name
-├── processed_logs/             # Auto-created output tree
+├── processed_logs/             # Output tree (auto-created)
 │   └── <YYYYMMDD>/
 │       └── <HHMMSS>/
 │           └── <original_filename>
-└── archive_logs/               # Original files moved here after success
-    └── <YYYYMMDD>/
-        └── <HHMMSS>/
-            └── <original_filename>
+├── archive_logs/               # Archive (chỉ khi dùng --input_path)
+└── Samples/                    # Sample data for testing
+
+D:\Log\final\                   # INPUT — tool trước tạo ra
+├── 20260627_142209\            #   timestamp-named directories
+│   ├── output_vrtt\            #   sub-paths per usecase
+│   ├── uc03\
+│   ├── uc06\
+│   └── output_domain\
+└── 20260627_203015\
+    └── ...
 ```
 
 ---
 
 ## ⚙️ Configuration Guide
 
-[configs/usecase_config.json](configs/usecase_config.json) — mỗi usecase chỉ cần định nghĩa `dedup_fields`.
+[configs/usecase_config.json](configs/usecase_config.json) — mỗi usecase cần 2 trường:
 
 ### JSON Schema
 
 ```json
 {
   "<usecase_name>": {
-    "dedup_fields": ["field_a", "field_b", "..."]
+    "dedup_fields": ["field_a", "field_b", "..."],
+    "input_pattern": "<glob_pattern_relative_to_timestamp_dir>"
   }
 }
 ```
 
 | Key | Type | Description |
 |---|---|---|
-| `dedup_fields` | `string[]` | Các cột dùng để tính `Occurrence_Count`. Các dòng có cùng tổ hợp giá trị trong 5 ngày qua sẽ có count cao hơn. |
+| `dedup_fields` | `string[]` | Các cột dùng để tính `Occurrence_Count`. |
+| `input_pattern` | `string` | Glob pattern để tìm file CSV trong thư mục timestamp. Hỗ trợ `*` wildcard. |
 
 ### Ví dụ
 
 ```json
 {
   "uc1": {
-    "dedup_fields": ["target_process_path", "hash_sha256"]
+    "dedup_fields": ["target_process_path", "hash_sha256"],
+    "input_pattern": "output_vrtt/output_final_uc01*.csv"
   },
   "uc6": {
-    "dedup_fields": ["service_target_file_path"]
+    "dedup_fields": ["service_target_file_path"],
+    "input_pattern": "uc06/final_uc06_merged*.csv"
   },
   "uc19": {
-    "dedup_fields": ["net_target_host_name", "source_process_path"]
+    "dedup_fields": ["net_target_host_name", "source_process_path"],
+    "input_pattern": "output_domain/output_uc19*.csv"
   }
 }
 ```
 
-> `whitelist_rules` trong config cũ đã bị **bỏ qua hoàn toàn**. Whitelist giờ dùng file CSV riêng.
-
-### Thêm usecase mới
-
-1. Thêm key mới vào `configs/usecase_config.json` với `dedup_fields`.
-2. (Tuỳ chọn) Tạo `whitelists/<usecase>.csv` — nếu chưa có, pipeline vẫn chạy bình thường (0 dòng bị whitelist).
-3. Đặt CSV input vào `input_logs/<usecase>.csv`.
-4. Chạy pipeline.
+Với config trên, khi chạy với `--timestamp_dir 20260627_142209`:
+- `uc1` → `D:\Log\final\20260627_142209\output_vrtt\output_final_uc01*.csv`
+- `uc6` → `D:\Log\final\20260627_142209\uc06\final_uc06_merged*.csv`
+- `uc19` → `D:\Log\final\20260627_142209\output_domain\output_uc19*.csv`
 
 ---
 
 ## 🛡 Whitelist System
 
-Whitelist được định nghĩa bằng file CSV trong thư mục `whitelists/`. Mỗi usecase có một file riêng: `whitelists/<usecase>.csv`.
+Whitelist dùng file CSV trong `whitelists/<usecase>.csv`.
 
-### Cấu trúc file whitelist
+### Cấu trúc
 
-```csv
-file_internalname,source_process_path
-TrialVerifier.exe,
-libxml2.dll,\\ManageEngine\\
-,\\Philips Dynalite\\
-```
-
-### Cơ chế matching
-
-| Phần tử | Ý nghĩa |
-|---|---|
-| **Cột** | Tên field trong log CSV. Phải khớp chính xác tên cột. |
-| **Giá trị** | Regex pattern. Plain text = exact match. |
-| **Ô trống** | Wildcard — bỏ qua field đó cho dòng này. |
-| **Trong 1 dòng** | **AND** — tất cả field có giá trị phải khớp. |
-| **Giữa các dòng** | **OR** — khớp bất kỳ dòng nào là bị loại khỏi log. |
-
-### Ví dụ matching
-
-Whitelist:
 ```csv
 field_a,field_b
 value1,
@@ -213,39 +180,50 @@ value1,
 value3,pattern4
 ```
 
-| Log row | field_a | field_b | Khớp? | Kết quả |
-|---|---|---|---|---|
-| A | `value1` | `xyz` | ✅ Dòng 1 (field_b trống → bỏ qua) | **Bị loại** |
-| B | `abc` | `pattern2` | ✅ Dòng 2 (field_a trống → bỏ qua) | **Bị loại** |
-| C | `value3` | `pattern4` | ✅ Dòng 3 (cả 2 field khớp) | **Bị loại** |
-| D | `value1` | `pattern4` | ❌ Chỉ khớp field_a của dòng 1, nhưng không phải cùng 1 dòng | **Giữ lại** |
-| E | `other` | `other` | ❌ Không khớp dòng nào | **Giữ lại** |
-
-### Không có file whitelist
-
-Nếu `whitelists/<usecase>.csv` không tồn tại hoặc rỗng → **pipeline vẫn chạy bình thường**, 0 dòng bị loại. Không crash.
+| Quy tắc | Mô tả |
+|---|---|
+| **Cột** | Tên field trong log CSV. |
+| **Giá trị** | Regex pattern. Plain text = exact match. |
+| **Ô trống** | Wildcard — bỏ qua field đó cho dòng này. |
+| **AND** trong 1 dòng | Tất cả field có giá trị phải khớp. |
+| **OR** giữa các dòng | Khớp bất kỳ dòng nào → bị loại. |
+| **Thiếu file** | Pipeline chạy bình thường, 0 dòng bị loại. |
 
 ---
 
 ## 🚀 Usage
 
-### Pipeline chính
+### 3 chế độ input
 
 ```bash
-# Process tất cả usecase trong input_logs/
+# ── Chế độ 1: Auto-detect (mặc định) ──
+# Tự chọn thư mục timestamp gần thời điểm hiện tại nhất
 python threat_hunter.py
 
-# Process 1 usecase cụ thể
+# ── Chế độ 2: Manual timestamp dir(s) ──
+# Chỉ định 1 hoặc nhiều thư mục
+python threat_hunter.py --timestamp_dir 20260627_142209
+python threat_hunter.py --timestamp_dir 20260627_142209 --timestamp_dir 20260627_203015
+
+# ── Chế độ 3: Legacy --input_path (test nhanh) ──
+python threat_hunter.py --input_path ./Samples/uc6.csv
+python threat_hunter.py --input_path ./Samples/
+```
+
+### Tuỳ chọn khác
+
+```bash
+# Lọc usecase cụ thể
 python threat_hunter.py --usecase uc6
 
-# Process từ file hoặc thư mục tuỳ chỉnh
-python threat_hunter.py --input_path ./custom_logs/
-python threat_hunter.py --input_path ./alerts.csv
+# Đổi base directory
+python threat_hunter.py --base_dir E:\OtherLogs\
 
-# Gắn nhãn cho lần chạy
+# Gắn nhãn run (vd: phân biệt ca)
 python threat_hunter.py --run_label ca1
+# → output: processed_logs/20260627/145530_ca1/
 
-# Dry-run (xem trước, không ghi file)
+# Dry-run + verbose
 python threat_hunter.py --dry-run --verbose
 ```
 
@@ -253,185 +231,112 @@ python threat_hunter.py --dry-run --verbose
 
 | Flag | Required | Default | Description |
 |---|---|---|---|
-| `--date` | No | Today | Execution date `YYYYMMDD`. |
+| `--base_dir` | No | `D:\Log\final\` | Thư mục gốc chứa timestamp subdirectories. |
+| `--timestamp_dir` | No | (auto) | Tên thư mục timestamp. Dùng nhiều lần để chọn nhiều dir. |
 | `--usecase` | No | All | Chỉ process usecase này. |
-| `--input_path` | No | `input_logs/` | File CSV hoặc thư mục input. |
+| `--input_path` | No | — | **Legacy**: đường dẫn trực tiếp đến CSV (bỏ qua timestamp logic). |
 | `--config` | No | `configs/usecase_config.json` | Path tới config. |
 | `--output_dir` | No | `processed_logs/` | Thư mục output gốc. |
-| `--archive_dir` | No | `archive_logs/` | Thư mục archive gốc. |
+| `--archive_dir` | No | `archive_logs/` | Thư mục archive gốc (chỉ dùng với `--input_path`). |
 | `--whitelist_dir` | No | `whitelists/` | Thư mục chứa whitelist CSV. |
-| `--run_label` | No | (none) | Nhãn cho thư mục timestamp (vd: `ca1` → `145530_ca1`). |
+| `--date` | No | Today | Ngày thực thi `YYYYMMDD`. |
+| `--run_label` | No | (none) | Nhãn cho thư mục run (vd: `ca1` → `145530_ca1`). |
 | `--verbose` | No | `false` | DEBUG logging. |
 | `--dry-run` | No | `false` | Mô phỏng, không ghi file. |
 
-### Archiving
+### Lưu ý
 
-| Input Source | Archive? |
-|---|---|
-| Default `input_logs/` | ✅ Yes → `archive_logs/<YYYYMMDD>/<HHMMSS>/` |
-| Custom `--input_path` | ❌ No — file gốc giữ nguyên |
+- **Không archive** khi dùng chế độ timestamp dir — file gốc trong `D:\Log\final\` không bị move.
+- **Archive chỉ hoạt động** với `--input_path` legacy mode.
 
 ---
 
 ## 🔄 Analyst Feedback Loop
 
-### Luồng làm việc
-
-```
-┌──────────┐     ┌──────────────┐     ┌──────────────┐
-│ Pipeline │ ──→ │ Analyst mở   │ ──→ │ update_white │
-│ xuất CSV │     │ CSV, điền "x"│     │ cập nhật     │
-│ +is_benign│    │ vào is_benign│     │ whitelist    │
-└──────────┘     └──────────────┘     └──────────────┘
-                                             │
-                                             ▼
-                                      ┌──────────────┐
-                                      │ Lần chạy sau │
-                                      │ tự động bỏ   │
-                                      │ qua dòng này │
-                                      └──────────────┘
-```
-
-### Bước 1: Pipeline xuất CSV có cột `is_benign`
-
-Mỗi dòng output có cột `is_benign` với giá trị rỗng:
+### 1. Pipeline xuất CSV có cột `is_benign`
 
 | service_target_name | Occurrence_Count | is_benign |
 |---|---|---|
 | BrYNSvc | 0 | |
 | suspicious_svc | 0 | |
-| unknown_process | 3 | |
 
-### Bước 2: Analyst đánh dấu dòng benign
+### 2. Analyst đánh dấu dòng benign
 
-Mở CSV trong Excel/text editor, điền `x` vào cột `is_benign`:
+Điền `x` vào cột `is_benign`:
 
 | service_target_name | Occurrence_Count | is_benign |
 |---|---|---|
 | BrYNSvc | 0 | **x** |
 | suspicious_svc | 0 | |
-| unknown_process | 3 | |
 
-### Bước 3: Cập nhật whitelist
+### 3. Cập nhật whitelist
 
 ```bash
 # Từ 1 thư mục run cụ thể
-python update_white.py --log_dir processed_logs/20260616/140528/
+python update_white.py --log_dir processed_logs/20260627/140528/
 
 # Từ thư mục ngày (quét tất cả run trong ngày)
-python update_white.py --log_dir processed_logs/20260616/
+python update_white.py --log_dir processed_logs/20260627/
 
 # Dry-run
-python update_white.py --log_dir processed_logs/20260616/140528/ --dry-run --verbose
+python update_white.py --log_dir processed_logs/20260627/ --dry-run --verbose
 ```
-
-Kết quả: giá trị `BrYNSvc` được thêm vào `whitelists/uc6.csv` (nếu chưa có).
 
 ### CLI Reference — `update_white.py`
 
 | Flag | Required | Default | Description |
 |---|---|---|---|
-| `--log_dir` | ✅ Yes | — | Thư mục processed log (có thể là run dir hoặc date dir). |
+| `--log_dir` | ✅ Yes | — | Thư mục processed log (run dir hoặc date dir). |
 | `--whitelist_dir` | No | `whitelists/` | Thư mục chứa whitelist CSV. |
-| `--config` | No | `configs/usecase_config.json` | Path tới config (để biết column mặc định cho whitelist mới). |
+| `--config` | No | `configs/usecase_config.json` | Config (để biết column mặc định cho whitelist mới). |
 | `--verbose` | No | `false` | DEBUG logging. |
 | `--dry-run` | No | `false` | Mô phỏng, không ghi file. |
-
-### Cơ chế của `update_white.py`
-
-1. Quét tất cả CSV trong `--log_dir`.
-2. Tìm dòng có `is_benign = "x"`.
-3. Nhóm theo usecase (từ tên file).
-4. Với mỗi usecase, đọc `whitelists/<usecase>.csv` để biết các cột cần extract.
-5. Extract giá trị các cột đó từ dòng benign.
-6. **Bỏ qua** dòng có tất cả field trống (tránh wildcard match-all).
-7. Thêm vào whitelist nếu chưa tồn tại.
-8. Nếu whitelist chưa có, tự tạo mới với columns = `dedup_fields` từ config.
 
 ---
 
 ## 🔬 Pipeline Walkthrough
 
-### Step 1 — CSV Ingestion
+### Step 1 — Input Resolution
+```
+Auto:      quét D:\Log\final\ → chọn <YYYYMMDD_HHMMSS> gần nhất
+Manual:    dùng --timestamp_dir được chỉ định
+Pattern:   config[usecase].input_pattern → glob trong timestamp dir
+→          D:\Log\final\<ts>\<pattern>
+```
+
+### Step 2 — CSV Ingestion
 ```python
 df = pd.read_csv(file_path, engine="c", low_memory=False)
 ```
-- C engine parser. Auto-detect comma vs tab.
+C engine, auto-detect comma vs tab.
 
-### Step 2 — Whitelist (CSV-based)
-```python
-wl_df = pd.read_csv("whitelists/<usecase>.csv")
-for _, wl_row in wl_df.iterrows():           # iterate whitelist rows (<1000)
-    row_mask = pd.Series(True, index=df.index)
-    for field in wl_fields:                   # iterate fields
-        if value is not empty:
-            row_mask &= df[field].str.contains(value, regex=True)
-    drop_mask |= row_mask                     # OR across whitelist rows
-df = df[~drop_mask]
-```
-- Whitelist rows iterated (thường < 1000), nhưng log rows luôn vectorized.
-- Giá trị rỗng = wildcard (bỏ qua).
-- AND trong cùng 1 dòng, OR giữa các dòng.
-- Không có file whitelist → 0 dòng bị loại.
+### Step 3 — Whitelist
+- So sánh từng dòng log với `whitelists/<usecase>.csv`.
+- AND trong 1 dòng whitelist, OR giữa các dòng.
+- Ô trống = wildcard.
 
-### Step 3 — Add `is_benign`
+### Step 4 — `is_benign` column
 ```python
 df["is_benign"] = ""
 ```
-- Cột rỗng để analyst đánh dấu sau. Luôn có trong output.
 
-### Step 4 — Historical Aggregation
-```python
-for day in find_5_days_with_data(date-1 ... date-30):
-    for run_dir in processed_logs/<day>/*:
-        for csv in run_dir/<usecase>*.csv:
-            frames.append(pd.read_csv(csv)[dedup_fields])
-historical = pd.concat(frames)
-```
+### Step 5 — Historical Aggregation
 - Scan ngược tối đa 30 ngày, thu thập đủ 5 ngày có data.
-- Bỏ qua ngày gap, **không tính ngày hiện tại**.
-- Chỉ đọc `dedup_fields` (memory efficient).
+- **Không tính ngày hiện tại.**
+- Chỉ đọc `dedup_fields`.
 
-### Step 5 — Frequency Counting
+### Step 6 — Occurrence Counting
 ```python
-counts = historical[dedup_fields].groupby(dedup_fields).size().reset_index(name="Occurrence_Count")
+counts = historical.groupby(dedup_fields).size().reset_index(name="Occurrence_Count")
 result = current.merge(counts, on=dedup_fields, how="left")
 result["Occurrence_Count"] = result["Occurrence_Count"].fillna(0)
 ```
-- **Chỉ đếm từ history**, không tính current.
-- `0` = chưa từng thấy trong quá khứ → đáng ngờ.
-- `> 0` = đã thấy N lần trong 5 ngày qua.
+- `0` = chưa từng thấy → đáng ngờ.
+- `> 0` = đã thấy N lần trong lịch sử.
 
-### Step 6 — Save & Archive
-```python
-df.to_csv("processed_logs/<YYYYMMDD>/<HHMMSS>/<file>.csv", index=False)
-shutil.move(source, "archive_logs/<YYYYMMDD>/<HHMMSS>/<file>.csv")
+### Step 7 — Save
 ```
-- Mỗi lần chạy = 1 thư mục timestamp riêng → không ghi đè.
-- Archive chỉ khi input là `input_logs/` mặc định.
-
----
-
-## 📊 Sample Data
-
-| File | Type | Key Fields |
-|---|---|---|
-| [uc1.csv](Samples/uc1.csv) | EDR/XDR process execution | `file_hash_md5`, `source_process_path`, `target_process_path` |
-| [uc2.csv](Samples/uc2.csv) | EDR DLL loading | `file_hash_md5`, `file_path`, `source_process_path` |
-| [uc3.csv](Samples/uc3.csv) | EDR process lineage | `source_process_path`, `target_commandline` |
-| [uc6.csv](Samples/uc6.csv) | Service enumeration | `service_target_name`, `target_commandline` |
-| [uc19.csv](Samples/uc19.csv) | Network DNS queries | `net_target_host_name`, `source_process_path` |
-
-### Quick Test
-
-```bash
-# Test pipeline
-python threat_hunter.py --input_path ./Samples/ --dry-run --verbose
-
-# Test update_white (cần output thật trước)
-python threat_hunter.py --input_path ./Samples/uc6.csv
-# ... đánh dấu is_benign='x' trong CSV output ...
-python update_white.py --log_dir processed_logs/<date>/<timestamp>/ --verbose
+processed_logs/<YYYYMMDD>/<HHMMSS>/<original_filename>
 ```
 
 ---
@@ -440,43 +345,37 @@ python update_white.py --log_dir processed_logs/<date>/<timestamp>/ --verbose
 
 | Trường hợp | Hành vi |
 |---|---|
-| **Thiếu file whitelist** | Pipeline chạy bình thường, 0 dòng bị whitelist. Log INFO. |
-| **File whitelist rỗng** | Pipeline chạy bình thường, 0 dòng bị whitelist. |
-| **Thiếu config usecase** | File đó bị SKIP với WARNING. Các file khác vẫn chạy. |
-| **Whitelist field không có trong log** | Field đó bị bỏ qua (WARNING). Các field khác vẫn được so sánh. |
-| **dedup_fields không khớp column log** | Occurrence_Count = 0 cho tất cả dòng (ERROR log). |
-| **Whitelist xoá 100% dòng** | Xuất CSV rỗng (chỉ có header + is_benign + Occurrence_Count). |
-| **Không có historical data** | Occurrence_Count = 0 cho tất cả dòng. |
-| **Ngày gap trong history** | Scan tiếp ngày xa hơn đến khi đủ 5 ngày có data hoặc hết 30 ngày. |
-| **Regex không hợp lệ trong whitelist** | Tự động escape thành literal string (WARNING). |
-| **Regex có capturing group `(...)`** | Vẫn hoạt động đúng (dùng `str.contains`). |
+| **Không có timestamp dir nào** | Auto-detect báo lỗi. Manual mode báo WARNING và bỏ qua. |
+| **Pattern không khớp file nào** | WARNING — usecase đó bị bỏ qua. |
+| **Thiếu `input_pattern` trong config** | Lỗi khi load config. |
+| **Thiếu file whitelist** | 0 dòng bị loại, pipeline chạy bình thường. |
+| **dedup_fields không khớp column** | Occurrence_Count = 0. |
+| **Whitelist xoá 100% dòng** | CSV rỗng (chỉ header + is_benign + Occurrence_Count). |
+| **Không có historical data** | Occurrence_Count = 0. |
+| **Ngày gap trong history** | Scan tiếp đến khi đủ 5 ngày hoặc hết 30 ngày. |
+| **Regex không hợp lệ** | Tự escape thành literal. |
 
 ---
 
 ## ❓ FAQ
 
-### Q: Tôi không có file whitelist — pipeline có chạy được không?
-**Có.** Pipeline chạy bình thường, 0 dòng bị loại bởi whitelist. Tạo file `whitelists/<usecase>.csv` sau nếu cần.
+### Q: Làm sao để thêm usecase mới?
+1. Thêm key vào `configs/usecase_config.json` với `dedup_fields` và `input_pattern`.
+2. (Tuỳ chọn) Tạo `whitelists/<usecase>.csv`.
+3. Chạy pipeline.
 
-### Q: Làm sao để thêm entry vào whitelist?
-Có 2 cách:
-1. **Tự động**: Đánh dấu `is_benign="x"` trong CSV output → chạy `update_white.py`.
-2. **Thủ công**: Mở `whitelists/<usecase>.csv` và thêm dòng mới.
+### Q: Tôi muốn chạy nhiều thư mục timestamp cùng lúc?
+```bash
+python threat_hunter.py --timestamp_dir 20260627_142209 --timestamp_dir 20260627_203015
+```
 
-### Q: Whitelist có phân biệt exact match và regex không?
-Mọi giá trị trong whitelist đều được coi là regex. `TrialVerifier.exe` là regex khớp chính xác `TrialVerifier.exe`. `Brother.*` khớp mọi chuỗi bắt đầu bằng `Brother`.
-
-### Q: Làm sao để whitelist 1 dòng mà không cần regex?
-Cứ ghi giá trị chính xác vào. Plain text = exact match trong regex. Không cần escape.
-
-### Q: update_white.py lấy những cột nào từ log để thêm vào whitelist?
-Các cột được định nghĩa sẵn trong `whitelists/<usecase>.csv`. Nếu file whitelist chưa tồn tại, script sẽ dùng `dedup_fields` từ config.
+### Q: File whitelist bị xoá hết nội dung thì sao?
+Pipeline vẫn chạy — 0 dòng bị whitelist. Không crash.
 
 ### Q: Occurrence_Count = 0 nghĩa là gì?
-Chưa từng thấy tổ hợp `dedup_fields` này trong 5 ngày qua → có thể là anomaly, cần analyst xem xét.
+Chưa từng thấy tổ hợp `dedup_fields` này trong 5 ngày qua → có thể là anomaly.
 
----
-
-## 📄 License
-
-Internal SOC tooling. All rights reserved.
+### Q: Tôi muốn test nhanh với 1 file CSV?
+```bash
+python threat_hunter.py --input_path ./Samples/uc6.csv --dry-run --verbose
+```

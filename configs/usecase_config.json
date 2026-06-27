@@ -1,17 +1,22 @@
 {
   "uc1": {
-    "dedup_fields": ["target_process_path", "hash_sha256"]
+    "dedup_fields": ["target_process_path", "hash_sha256"],
+    "input_pattern": "output_vrtt/output_final_uc01*.csv"
   },
   "uc2": {
-    "dedup_fields": ["file_path", "hash_sha256"]
+    "dedup_fields": ["file_path", "hash_sha256"],
+    "input_pattern": "output_vrtt/output_final_uc02*.csv"
   },
   "uc3": {
-    "dedup_fields": ["source_process_path", "target_commandline"]
+    "dedup_fields": ["source_process_path", "target_commandline"],
+    "input_pattern": "uc03/final_uc03_merged*.csv"
   },
   "uc6": {
-    "dedup_fields": ["service_target_file_path"]
+    "dedup_fields": ["service_target_file_path"],
+    "input_pattern": "uc06/final_uc06_merged*.csv"
   },
   "uc19": {
-    "dedup_fields": ["net_target_host_name", "source_process_path"]
+    "dedup_fields": ["net_target_host_name", "source_process_path"],
+    "input_pattern": "output_domain/output_uc19*.csv"
   }
 }
