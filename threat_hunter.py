@@ -704,10 +704,19 @@ def process_usecase_file(
     df = compute_occurrence_counts(df, historical_df, dedup_fields)
 
     # Step 6: Save & Archive
-    # Output  = processed_logs/<parent_date>/<child_ts>/<filename>
-    # Archive = archive_logs/<parent_date>/<child_ts>/<filename>  (copy)
-    output_path = Path(output_dir) / parent_date / child_ts / original_filename
-    archive_path = Path(archive_dir) / parent_date / child_ts / original_filename
+    # Always save as <usecase>.csv so historical lookup works consistently.
+    safe_name = usecase_name + ".csv"
+    output_path = Path(output_dir) / parent_date / child_ts / safe_name
+    archive_path = Path(archive_dir) / parent_date / child_ts / safe_name
+
+    # Handle collisions within the same run (multiple files → same usecase)
+    if not dry_run and output_path.exists():
+        counter = 2
+        while output_path.exists():
+            safe_name = "%s_%d.csv" % (usecase_name, counter)
+            output_path = Path(output_dir) / parent_date / child_ts / safe_name
+            archive_path = Path(archive_dir) / parent_date / child_ts / safe_name
+            counter += 1
 
     save_and_archive(df, output_path, archive_path, dry_run=dry_run)
     return True
